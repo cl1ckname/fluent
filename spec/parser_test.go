@@ -151,3 +151,14 @@ func TestExtractGofmtPrefix(t *testing.T) {
 		t.Errorf("positions %d, %d; want 15, 74", cs[0].Pos(), cs[1].Pos())
 	}
 }
+
+func TestExtractGofmtBlock(t *testing.T) {
+	doc := &ast.CommentGroup{List: []*ast.Comment{
+		{Slash: 1, Text: "/*\n@ requires a<c> == b<c>;\n\n\treturns amount<a<c>>;\n*/"},
+		{Slash: 100, Text: "/* обычный комментарий с @ внутри */"},
+	}}
+	cs, errs := ParseDoc(doc)
+	if len(errs) > 0 || len(cs) != 2 {
+		t.Fatalf("clauses %v, errors %v", cs, errs)
+	}
+}

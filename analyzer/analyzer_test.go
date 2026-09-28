@@ -9,5 +9,5 @@ import (
 )
 
 func TestAnalyzer(t *testing.T) {
-	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "money", "syntax", "specerrors")
+	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "money", "syntax", "specerrors", "flow")
 }

@@ -52,7 +52,7 @@ func main() {
 	a2 := newAmount(rub, 12)
 	a3 := a1.sum(a2)
 	a4 := newAmount(usd, 1)
-	a5 := a4.sum(a3) // TODO: want `cannot prove a4<c> == a3<c>`
+	a5 := a4.sum(a3) // want `cannot prove a4<c> == a3<c> \("usd" vs "rub"\)`
 	_ = a5
 	_ = wallet{main: a1, reserve: a3}
 }
