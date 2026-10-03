@@ -516,22 +516,41 @@ func (fc *funcChecker) ifStmt(s *ast.IfStmt) {
 	fc.fl = fc.join(thenFl, fc.fl)
 }
 
-func (fc *funcChecker) assume(eqs [][2]term) {
-	for _, e := range eqs {
+// facts — то, что известно из условия: равенства и пары, про которые известно,
+// что они различны. Различия в состоянии не хранятся: они только проверяются
+// в момент assume — если пара уже выведена равной, точка недостижима.
+type facts struct {
+	eqs, neqs [][2]term
+}
+
+func (f facts) and(g facts) facts {
+	return facts{append(f.eqs, g.eqs...), append(f.neqs, g.neqs...)}
+}
+
+func (fc *funcChecker) assume(f facts) {
+	for _, e := range f.eqs {
 		fc.fl.st.AssertEqual(e[0], e[1])
+	}
+	for _, e := range f.neqs {
+		if fc.fl.st.AreEqual(e[0], e[1]) {
+			fc.fl.dead = true
+		}
 	}
 }
 
-// cond вычисляет условие и возвращает равенства, верные, когда оно истинно (pos)
+// cond вычисляет условие и возвращает факты, верные, когда оно истинно (pos)
 // и когда ложно (neg).
-func (fc *funcChecker) cond(e ast.Expr) (pos, neg [][2]term) {
+func (fc *funcChecker) cond(e ast.Expr) (pos, neg facts) {
 	switch e := ast.Unparen(e).(type) {
 	case *ast.BinaryExpr:
 		switch e.Op {
-		case token.EQL:
-			return [][2]term{{fc.expr(e.X), fc.expr(e.Y)}}, nil
-		case token.NEQ:
-			return nil, [][2]term{{fc.expr(e.X), fc.expr(e.Y)}}
+		case token.EQL, token.NEQ:
+			f := facts{eqs: [][2]term{{fc.expr(e.X), fc.expr(e.Y)}}}
+			nf := facts{neqs: f.eqs}
+			if e.Op == token.NEQ {
+				return nf, f
+			}
+			return f, nf
 		case token.LAND:
 			p1, _ := fc.cond(e.X)
 			// Правая часть вычисляется, только если левая истинна.
@@ -540,7 +559,7 @@ func (fc *funcChecker) cond(e ast.Expr) (pos, neg [][2]term) {
 			fc.assume(p1)
 			p2, _ := fc.cond(e.Y)
 			fc.fl = saved
-			return append(p1, p2...), nil
+			return p1.and(p2), facts{}
 		case token.LOR:
 			_, n1 := fc.cond(e.X)
 			saved := fc.fl
@@ -548,7 +567,7 @@ func (fc *funcChecker) cond(e ast.Expr) (pos, neg [][2]term) {
 			fc.assume(n1)
 			_, n2 := fc.cond(e.Y)
 			fc.fl = saved
-			return nil, append(n1, n2...)
+			return facts{}, n1.and(n2)
 		}
 	case *ast.UnaryExpr:
 		if e.Op == token.NOT {
@@ -557,7 +576,7 @@ func (fc *funcChecker) cond(e ast.Expr) (pos, neg [][2]term) {
 		}
 	}
 	fc.expr(e)
-	return nil, nil
+	return facts{}, facts{}
 }
 
 // join сливает два потока: остаются равенства, верные в обоих.

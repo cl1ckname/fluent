@@ -75,3 +75,37 @@ func closures() {
 	}
 	f()
 }
+
+// Ветка, противоречащая выведенному равенству, недостижима.
+// @ requires a<c> == b<c>;
+// @ returns amount<a<c>>;
+func deadNeq(a, b amount) amount {
+	if a.currency != b.currency {
+		return newAmount("x", 0)
+	}
+	if a.currency == b.currency {
+		return a
+	}
+	return newAmount("y", 0)
+}
+
+// @ requires a<c> == b<c>;
+// @ returns amount<a<c>>;
+func deadNeqAnd(a, b amount, ok bool) amount {
+	if ok && b.currency != a.currency {
+		return newAmount("x", 0)
+	}
+	if a.currency == "rub" && b.currency != "rub" {
+		return newAmount("x", 0)
+	}
+	return a
+}
+
+// Без предусловия ветка достижима.
+// @ returns amount<a<c>>;
+func liveNeq(a, b amount) amount {
+	if a.currency != b.currency {
+		return b // want `cannot prove result 1 satisfies returns`
+	}
+	return b
+}
