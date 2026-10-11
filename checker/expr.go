@@ -25,8 +25,12 @@ func (fc *funcChecker) idx(base term, p *bound.Param) term {
 	return fc.bank.App(p.Owner.Pkg().Path()+"."+p.Owner.Name()+"<"+p.Name+">", base)
 }
 
-// deref — терм значения *p.
+// deref — терм значения *p. Если p указывает в известное место блока, это
+// текущая версия содержимого.
 func (fc *funcChecker) deref(p term) term {
+	if t, ok := fc.derefBlock(p); ok {
+		return t
+	}
 	return fc.bank.App("*", p)
 }
 
@@ -40,6 +44,12 @@ func (fc *funcChecker) nilTerm() term { return fc.bank.Const("nil") }
 
 // expr вычисляет терм значения выражения (и проверяет вызовы внутри него).
 func (fc *funcChecker) expr(e ast.Expr) term {
+	t := fc.eval(e)
+	fc.terms[ast.Unparen(e)] = t
+	return t
+}
+
+func (fc *funcChecker) eval(e ast.Expr) term {
 	if tv, ok := fc.info.Types[e]; ok && tv.Value != nil {
 		return fc.constant(tv.Value)
 	}
@@ -51,6 +61,9 @@ func (fc *funcChecker) expr(e ast.Expr) term {
 		case *types.Nil:
 			return fc.nilTerm()
 		case *types.Var:
+			if !fc.suppressed(e) && fc.specs.Dependent(obj.Type()) {
+				fc.checkRoot(e.Pos(), e, fc.memRoot(e), false)
+			}
 			if t, ok := fc.fl.cur[obj]; ok {
 				return t
 			}
@@ -69,15 +82,22 @@ func (fc *funcChecker) expr(e ast.Expr) term {
 		switch e.Op {
 		case token.AND:
 			// &x: *p ≈ x. Индексы x стабильны, поэтому это верно и дальше.
+			fc.noAccess(e.X)
 			x := fc.expr(e.X)
 			p := fc.fresh("&" + types.ExprString(e.X))
 			fc.fl.st.AssertEqual(fc.deref(p), x)
+			fc.addrOf(p, e.X)
 			return p
 		}
 		fc.expr(e.X)
 	case *ast.StarExpr:
-		return fc.deref(fc.expr(e.X))
+		p := fc.expr(e.X)
+		if !fc.suppressed(e) {
+			fc.checkPtr(e.Pos(), e, p, false)
+		}
+		return fc.deref(p)
 	case *ast.FuncLit:
+		fc.escapeCaptures(e)
 		fc.checkFunc(fc.info.TypeOf(e).(*types.Signature), e.Body, nil)
 	case *ast.BinaryExpr:
 		fc.expr(e.X)
@@ -106,21 +126,45 @@ func (fc *funcChecker) selector(e *ast.SelectorExpr) term {
 	if sel == nil || sel.Kind() != types.FieldVal || len(sel.Index()) != 1 {
 		// pkg.X, method value, поле встроенной структуры — значение неизвестно.
 		if sel != nil {
-			fc.expr(e.X)
+			if sel.Kind() == types.MethodVal {
+				fc.methodValue(e, sel)
+			} else {
+				fc.noAccess(e.X)
+				fc.expr(e.X)
+			}
+			if sel.Kind() == types.FieldVal && !fc.suppressed(e) &&
+				(fc.specs.Dependent(sel.Obj().Type()) || fc.promotedSpec(sel)) {
+				fc.checkRoot(e.Sel.Pos(), e, fc.memRoot(e), false)
+			}
 		}
 		return fc.fresh(types.ExprString(e))
 	}
 	xt := fc.info.TypeOf(e.X)
 	viaPtr := isPointer(xt)
+	if !viaPtr {
+		fc.noAccess(e.X)
+	}
 	base := fc.expr(e.X)
 	if viaPtr {
 		base = fc.deref(base)
+	}
+	if f := sel.Obj().(*types.Var); !fc.suppressed(e) && fc.dependentField(derefType(xt), f) {
+		fc.checkRoot(e.Sel.Pos(), e, fc.memRoot(e), false)
 	}
 	stable := !viaPtr
 	if root := fc.rootVar(e.X); root == nil || fc.addrTaken[root] {
 		stable = false
 	}
-	return fc.fieldRead(base, derefType(xt), sel.Obj().(*types.Var), stable)
+	f := sel.Obj().(*types.Var)
+	t := fc.fieldRead(base, derefType(xt), f, stable)
+	// Владеющее поле в памяти: указатель на дочерний блок слота (OWNLOAD).
+	if fc.specs.Owning(f) {
+		if b, path, ok := fc.place(e); ok {
+			c := fc.childAt(b, path, derefType(f.Type()))
+			fc.fl.ptrs[t] = ptrInfo{blocks: []blockID{c}, dependent: true}
+		}
+	}
+	return t
 }
 
 // fieldRead — терм поля f значения base типа st. Индексы стабильны всегда;
@@ -228,19 +272,28 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 
 	vars := map[*types.Var]term{}
 	names := map[*types.Var]string{}
+	recvTerm, recvType := none, types.Type(nil)
 	if recvExpr != nil {
 		recv := sig.Recv()
-		t := fc.expr(recvExpr)
 		have, want := isPointer(fc.info.TypeOf(recvExpr)), isPointer(recv.Type())
+		if want && !have {
+			fc.noAccess(recvExpr)
+		}
+		t := fc.expr(recvExpr)
 		switch {
 		case want && !have: // неявный &x
 			p := fc.fresh("&" + types.ExprString(recvExpr))
 			fc.fl.st.AssertEqual(fc.deref(p), t)
+			fc.addrOf(p, recvExpr)
 			t = p
 		case !want && have: // неявный *p
+			if fc.specs.Dependent(recv.Type()) {
+				fc.checkRoot(recvExpr.Pos(), recvExpr, fc.ptrRoot(recvExpr), false)
+			}
 			t = fc.deref(t)
 		}
 		vars[recv], names[recv] = t, types.ExprString(recvExpr)
+		recvTerm, recvType = t, recv.Type()
 	}
 
 	argTerms := fc.values(args, tupleLen(sig))
@@ -271,12 +324,23 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 		}
 	}
 
+	calleeName := types.ExprString(call.Fun)
+	if fn != nil {
+		calleeName = fn.Name()
+	}
 	if sig == nil {
+		fc.escapeCall(call, fn, calleeName, recvTerm, recvType, args, argTerms)
 		return []term{fc.fresh("call")}
 	}
 	results := make([]term, sig.Results().Len())
 	for i := range results {
 		results[i] = fc.fresh("result")
+	}
+	if len(results) == 1 && fc.isBuiltin(fun, "new") {
+		if elem := derefType(sig.Results().At(0).Type()); fc.specs.Tracked(elem) {
+			b := fc.newBlock(fmt.Sprintf("(%s at line %d)", types.ExprString(call), fc.line(call.Pos())), elem, fc.zero(elem, call.Pos()))
+			fc.fl.ptrs[results[0]] = ptrInfo{blocks: []blockID{b}, dependent: true}
+		}
 	}
 	if spec != nil && spec.Returns != nil {
 		for i, r := range spec.Returns {
@@ -289,7 +353,44 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 			}
 		}
 	}
+	// Правило вызова по сводке (§11.4) — после returns: термы returns берутся
+	// на входе, до новых версий памяти.
+	pParams, pTerms, pNames := fc.callParams(sig, recvTerm, args, argTerms)
+	if call == fc.async || !fc.applyCall(call, fn, pParams, pTerms, pNames, results) {
+		fc.escapeCall(call, fn, calleeName, recvTerm, recvType, args, argTerms)
+	} else if sig.Variadic() && len(args) == len(argTerms) {
+		// Вариативные аргументы попадают в срез: утекают.
+		why := fmt.Sprintf("passed to %s at line %d", calleeName, fc.line(call.Lparen))
+		for i := sig.Params().Len() - 1; i < len(args); i++ {
+			fc.escape(argTerms[i], fc.info.TypeOf(args[i]), why, 2)
+		}
+	}
 	return results
+}
+
+// callParams — параметры вызова по позициям сводки, их значения и тексты.
+func (fc *funcChecker) callParams(sig *types.Signature, recv term, args []ast.Expr, argTerms []term) ([]*types.Var, []term, []string) {
+	var ps []*types.Var
+	var ts []term
+	var ns []string
+	if sig.Recv() != nil {
+		ps, ts, ns = append(ps, sig.Recv()), append(ts, recv), append(ns, "receiver")
+	}
+	n := sig.Params().Len()
+	if sig.Variadic() {
+		n--
+	}
+	for i := range n {
+		t, name := none, sig.Params().At(i).Name()
+		if i < len(argTerms) {
+			t = argTerms[i]
+		}
+		if i < len(args) && len(args) == len(argTerms) {
+			name = types.ExprString(args[i])
+		}
+		ps, ts, ns = append(ps, sig.Params().At(i)), append(ts, t), append(ns, name)
+	}
+	return ps, ts, ns
 }
 
 // tupleLen — сколько значений ждёт вызов: для f(g()) с многозначным g.
@@ -321,8 +422,13 @@ func (fc *funcChecker) compositeLit(e *ast.CompositeLit) term {
 	t := fc.info.TypeOf(e)
 	st, ok := t.Underlying().(*types.Struct)
 	if !ok {
+		why := fmt.Sprintf("stored in a composite literal at line %d", fc.line(e.Pos()))
 		for _, el := range e.Elts {
-			fc.expr(el)
+			if kv, ok := el.(*ast.KeyValueExpr); ok {
+				fc.escape(fc.expr(kv.Key), fc.info.TypeOf(kv.Key), why, 2)
+				el = kv.Value
+			}
+			fc.escape(fc.expr(el), fc.info.TypeOf(el), why, 2)
 		}
 		return fc.fresh("lit")
 	}
@@ -423,4 +529,51 @@ func derefType(t types.Type) types.Type {
 		return p.Elem()
 	}
 	return t
+}
+
+func (fc *funcChecker) isBuiltin(fun ast.Expr, name string) bool {
+	id, ok := fun.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	b, ok := fc.info.Uses[id].(*types.Builtin)
+	return ok && b.Name() == name
+}
+
+// methodValue — x.M без вызова: receiver связывается со значением-функцией
+// и утекает вместе с ним.
+func (fc *funcChecker) methodValue(e *ast.SelectorExpr, sel *types.Selection) {
+	recv := sel.Obj().(*types.Func).Type().(*types.Signature).Recv()
+	xt := fc.info.TypeOf(e.X)
+	implicitAddr := isPointer(recv.Type()) && !isPointer(xt)
+	if implicitAddr {
+		fc.noAccess(e.X)
+	}
+	t := fc.expr(e.X)
+	why := fmt.Sprintf("bound to method value %s at line %d", types.ExprString(e), fc.line(e.Pos()))
+	if implicitAddr {
+		if r := fc.memRoot(e.X); r.kind == rootBlocks {
+			fc.lose(r.blocks, why)
+		}
+		return
+	}
+	fc.escape(t, xt, why, 2)
+}
+
+// promotedSpec — аннотировано ли поле, доступное через встроенную структуру.
+func (fc *funcChecker) promotedSpec(sel *types.Selection) bool {
+	t := sel.Recv()
+	idx := sel.Index()
+	for i, j := range idx {
+		st, ok := derefType(t).Underlying().(*types.Struct)
+		if !ok {
+			return false
+		}
+		f := st.Field(j)
+		if i == len(idx)-1 {
+			return fc.specs.FieldSpec(derefType(t), f) != nil
+		}
+		t = f.Type()
+	}
+	return false
 }

@@ -32,6 +32,71 @@ func (in *Info) Bounded(t types.Type) *Struct {
 	return nil
 }
 
+// FieldSpec возвращает аннотацию equals/close поля f структуры t или nil.
+func (in *Info) FieldSpec(t types.Type, f *types.Var) *Field {
+	if s := in.StructOf(t); s != nil {
+		for _, fa := range s.Fields {
+			if fa.Var == f {
+				return fa
+			}
+		}
+	}
+	return nil
+}
+
+// Dependent сообщает, есть ли в значении типа t зависимые поля — поля
+// с equals/close, в том числе во вложенных по значению структурах и массивах.
+// Только такие поля защищаются правами доступа (ALIASING_DESIGN.md, §11.1).
+func (in *Info) Dependent(t types.Type) bool {
+	if s := in.StructOf(t); s != nil && len(s.Fields) > 0 {
+		return true
+	}
+	switch u := t.Underlying().(type) {
+	case *types.Struct:
+		for f := range u.Fields() {
+			if in.Dependent(f.Type()) {
+				return true
+			}
+		}
+	case *types.Array:
+		return in.Dependent(u.Elem())
+	}
+	return false
+}
+
+// Tracked сообщает, нужны ли права на память со значением типа t: в нём есть
+// зависимые или владеющие поля.
+func (in *Info) Tracked(t types.Type) bool { return in.tracked(t, map[types.Type]bool{}) }
+
+func (in *Info) tracked(t types.Type, seen map[types.Type]bool) bool {
+	if in.Dependent(t) {
+		return true
+	}
+	if seen[t] {
+		return false
+	}
+	seen[t] = true
+	switch u := t.Underlying().(type) {
+	case *types.Struct:
+		for f := range u.Fields() {
+			if p, ok := f.Type().Underlying().(*types.Pointer); ok && in.tracked(p.Elem(), seen) ||
+				!ok && in.tracked(f.Type(), seen) {
+				return true
+			}
+		}
+	case *types.Array:
+		return in.tracked(u.Elem(), seen)
+	}
+	return false
+}
+
+// Owning сообщает, владеет ли поле f объектом, на который указывает:
+// это указатель на значение, которому нужны права (ALIASING_DESIGN.md, §11.10).
+func (in *Info) Owning(f *types.Var) bool {
+	p, ok := f.Type().Underlying().(*types.Pointer)
+	return ok && in.Tracked(p.Elem())
+}
+
 // Struct — структура с `bound` и/или аннотированными полями.
 type Struct struct {
 	Obj    *types.TypeName

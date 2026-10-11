@@ -30,24 +30,30 @@ func Check(pkg *Package, report func(Diagnostic)) {
 	c.specs = bound.Resolve(pkg.Files, pkg.Types, pkg.Info, func(pos token.Pos, msg string) {
 		report(Diagnostic{Pos: pos, Message: msg})
 	})
+	var funcs []funcDecl
 	for _, f := range pkg.Files {
 		for _, d := range f.Decls {
 			fd, ok := d.(*ast.FuncDecl)
 			if !ok || fd.Body == nil {
 				continue
 			}
-			obj, _ := c.info.Defs[fd.Name].(*types.Func)
-			if obj == nil {
-				continue
+			if obj, _ := c.info.Defs[fd.Name].(*types.Func); obj != nil {
+				funcs = append(funcs, funcDecl{obj, fd})
 			}
-			c.checkFunc(obj.Type().(*types.Signature), fd.Body, c.specs.Funcs[obj])
 		}
+	}
+	// Сначала сводки (молча), затем проверка тел с готовыми сводками.
+	c.summarize(funcs)
+	for _, f := range funcs {
+		c.checkFunc(f.obj.Type().(*types.Signature), f.decl.Body, c.specs.Funcs[f.obj])
 	}
 }
 
 type checker struct {
-	pkg    *Package
-	info   *types.Info
-	specs  *bound.Info
-	report func(Diagnostic)
+	pkg       *Package
+	info      *types.Info
+	specs     *bound.Info
+	report    func(Diagnostic)
+	silent    int // > 0: пробный проход, диагностики не выдаются
+	summaries map[*types.Func]*summary
 }

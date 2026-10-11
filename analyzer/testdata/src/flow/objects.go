@@ -29,7 +29,9 @@ func mutations() {
 	w.main.value = 42
 	w.name = "x"
 	_ = w.main.sum(w.reserve)
-	rub.currency = "usd" // want `cannot prove assignment to rub.currency preserves rub<c> \("usd" vs "rub"\)`
+	// Значение никто, кроме функции, не видит: индекс, который задаёт одно
+	// поле, можно менять (ALIASING_DESIGN.md, §13).
+	rub.currency = "usd"
 	rub.currency = "rub"
 
 	// Обычная переменная — не объект: её можно переприсвоить значением с другим индексом.
@@ -38,27 +40,33 @@ func mutations() {
 	_ = x.sum(usd)
 }
 
-// Указатели: индекс объекта за указателем стабилен.
+// Указатели: объект за указателем — блок памяти. Запись при полном праве
+// даёт новую версию и может менять индекс; она видна через все алиасы.
 func pointers() {
 	x := newAmount("rub", 1)
 	y := newAmount("rub", 2)
 	z := newAmount("usd", 3)
-	x.add(y)
 	p := &x
-	p.add(y)
-	p.add(z) // want `cannot prove p<c> == z<c> \("rub" vs "usd"\)`
-	*p = z   // want `cannot prove assignment to \*p preserves`
-	x = z    // want `cannot prove assignment to x preserves`
+	_ = p.sum(y)
+	_ = p.sum(z) // want `cannot prove p<c> == z<c> \("rub" vs "usd"\)`
+	*p = z
+	_ = x.sum(z)
+	_ = x.sum(y) // want `cannot prove x<c> == y<c> \("usd" vs "rub"\)`
 	q := &amount{currency: "usd"}
-	q.add(z)
 	q.value = 1
-	q.currency = "rub" // want `cannot prove assignment to q.currency preserves`
+	q.currency = "rub"
+	_ = q.sum(y)
+
+	// Вызов метода с pointer-receiver по сводке возвращает права.
+	x.add(z)
+	x.value = 2
+	x.currency = "usd"
 }
 
 // Метод с pointer-receiver: индекс receiver-а известен из requires.
 // @ requires a<c> == b<c>;
 func (a *amount) addTwice(b amount) {
-	a.add(b)
+	_ = a.sum(b)
 	a.add(a.sum(b))
 	a.add(newAmount("rub", 1)) // want `cannot prove a<c> == newAmount\("rub", 1\)<c>`
 }

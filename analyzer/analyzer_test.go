@@ -11,3 +11,7 @@ import (
 func TestAnalyzer(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "money", "syntax", "specerrors", "flow")
 }
+
+func TestAlias(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "alias")
+}

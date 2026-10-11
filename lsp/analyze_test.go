@@ -142,3 +142,21 @@ func TestPhysicalPositionsAndSpecErrors(t *testing.T) {
 		t.Fatalf("missing spec error: %+v", result)
 	}
 }
+
+func TestAnalyzeAlias(t *testing.T) {
+	dir := testModule(t)
+	writeFile(t, dir, "defs.go", definitions)
+	path := writeFile(t, dir, "alias.go", `package money
+var kept *amount
+func keep(a *amount) { kept = a }
+func lost() {
+	p := &amount{currency: "usd"}
+	keep(p)
+	_ = p.currency
+}
+`)
+	got := analyze(context.Background(), dir, nil).diagnostics[path]
+	if len(got) != 1 || !strings.Contains(string(got[0].Message.(protocol.String)), "cannot read p.currency: no access") {
+		t.Fatalf("got %+v, want one access diagnostic", got)
+	}
+}

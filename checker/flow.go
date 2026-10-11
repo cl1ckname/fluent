@@ -18,10 +18,28 @@ type flow struct {
 	st   *congruence.State
 	cur  map[*types.Var]term
 	dead bool // точка недостижима (после return, panic, break, ...)
+
+	// Слой прав (alias.go).
+	ptrs    map[term]ptrInfo       // указатели, связанные с блоками
+	perms   map[blockID]perm       // права кадра на блоки
+	varBlk  map[*types.Var]blockID // память локальных переменных с взятым адресом
+	content map[blockID]term       // текущие версии блоков (кроме памяти переменных)
+
+	// Регионы (own.go).
+	owner    map[blockID]ownerRef // владельцы дочерних блоков
+	children map[slotKey]blockID  // что лежит во владеющих слотах
+}
+
+func newFlow(st *congruence.State) *flow {
+	return &flow{st: st, cur: map[*types.Var]term{}, ptrs: map[term]ptrInfo{}, perms: map[blockID]perm{},
+		varBlk: map[*types.Var]blockID{}, content: map[blockID]term{},
+		owner: map[blockID]ownerRef{}, children: map[slotKey]blockID{}}
 }
 
 func (f *flow) clone() *flow {
-	return &flow{st: f.st.Clone(), cur: maps.Clone(f.cur), dead: f.dead}
+	return &flow{st: f.st.Clone(), cur: maps.Clone(f.cur), dead: f.dead,
+		ptrs: maps.Clone(f.ptrs), perms: maps.Clone(f.perms), varBlk: maps.Clone(f.varBlk), content: maps.Clone(f.content),
+		owner: maps.Clone(f.owner), children: maps.Clone(f.children)}
 }
 
 // funcChecker проверяет одно тело функции.
@@ -33,35 +51,76 @@ type funcChecker struct {
 	spec  *bound.Func         // контракт проверяемой функции или nil
 	entry map[*types.Var]term // значения параметров на входе (для returns)
 
-	addrTaken  map[*types.Var]bool // адрес взят или переменная захвачена замыканием
+	addrTaken  map[*types.Var]bool      // адрес взят или переменная захвачена замыканием
+	captured   map[*types.Var]token.Pos // переменная захвачена замыканием: где
 	gotoLabels map[string]bool
 	nfresh     int
+
+	// Слой прав (alias.go).
+	terms        map[ast.Expr]term      // последние вычисленные термы выражений
+	suppress     map[ast.Expr]bool      // выражения, вычисляемые не как чтение памяти
+	blocks       []string               // имена блоков
+	blockType    map[blockID]types.Type // типы блоков
+	blockVar     map[blockID]*types.Var // блок — память переменной
+	entryContent map[blockID]term       // содержимое блоков-параметров на входе
+	atEntry      bool                   // термы спецификации берутся на входе (returns)
+	losses       []loss                 // журнал потерь прав
+	writes       []blockID              // журнал записей в блоки
+
+	// Сводка (summary.go).
+	paramBlocks []blockID // блоки параметров по позициям сводки, -1 — нет
+	acc         map[blockID]access
+	sum         *summary
+	exited      bool          // уже был выход: результаты сводки сливаются
+	async       *ast.CallExpr // вызов в операторе go
+	storing     string        // текст записываемого значения, для сообщений
 }
 
-func (c *checker) checkFunc(sig *types.Signature, body *ast.BlockStmt, spec *bound.Func) {
+// checkFunc проверяет тело и возвращает выведенную сводку.
+func (c *checker) checkFunc(sig *types.Signature, body *ast.BlockStmt, spec *bound.Func) *summary {
 	bank := congruence.NewBank()
 	fc := &funcChecker{
 		checker: c,
 		bank:    bank,
-		fl:      &flow{st: congruence.NewState(bank), cur: map[*types.Var]term{}},
+		fl:      newFlow(congruence.NewState(bank)),
 		sig:     sig,
 		spec:    spec,
 		entry:   map[*types.Var]term{},
+
+		terms:        map[ast.Expr]term{},
+		suppress:     map[ast.Expr]bool{},
+		blockType:    map[blockID]types.Type{},
+		blockVar:     map[blockID]*types.Var{},
+		entryContent: map[blockID]term{},
+		acc:          map[blockID]access{},
+		sum:          emptySummary(sig),
 	}
 	fc.prescan(body)
-	params := []*types.Var{sig.Recv()}
-	for v := range sig.Params().Variables() {
-		params = append(params, v)
-	}
-	for _, v := range params {
-		if v != nil && v.Name() != "" && v.Name() != "_" {
-			t := fc.fresh(v.Name())
-			fc.entry[v], fc.fl.cur[v] = t, t
+	params := sigParams(sig)
+	fc.paramBlocks = make([]blockID, len(params))
+	for i, v := range params {
+		fc.paramBlocks[i] = -1
+		if v.Name() == "" || v.Name() == "_" {
+			continue
 		}
+		t := fc.fresh(v.Name())
+		fc.entry[v], fc.fl.cur[v] = t, t
+		// Параметр-указатель — отдельный блок с полным правом. Что из него
+		// нужно на самом деле, записывается в сводку и проверяется в точке
+		// вызова (§11.4).
+		if isPointer(v.Type()) {
+			in := fc.bank.App("*", t)
+			b := fc.newBlock(v.Name(), derefType(v.Type()), in)
+			fc.entryContent[b] = in
+			fc.fl.ptrs[t] = ptrInfo{blocks: []blockID{b}, dependent: true}
+			fc.paramBlocks[i] = b
+		}
+		fc.defineVar(v)
 	}
 	for v := range sig.Results().Variables() {
 		if v.Name() != "" && v.Name() != "_" {
 			fc.fl.cur[v] = fc.zero(v.Type(), body.Pos())
+			fc.defineVar(v)
 		}
 	}
 	// Внутри функции её предусловие считается верным.
@@ -71,6 +130,8 @@ func (c *checker) checkFunc(sig *types.Signature, body *ast.BlockStmt, spec *bou
 		}
 	}
 	fc.stmts(body.List)
+	fc.exit(nil)
+	return fc.finishSummary()
 }
 
 func (fc *funcChecker) fresh(hint string) term {
@@ -78,9 +139,19 @@ func (fc *funcChecker) fresh(hint string) term {
 	return fc.bank.Atom(fmt.Sprintf("%s#%d", hint, fc.nfresh))
 }
 
+// defineVar — объявление переменной: у переменной с взятым адресом
+// появляется новая память (на каждой итерации цикла — своя).
+func (fc *funcChecker) defineVar(v *types.Var) {
+	if fc.addrTaken[v] && fc.specs.Tracked(v.Type()) {
+		b := fc.newBlock(v.Name(), v.Type(), none)
+		fc.blockVar[b] = v
+		fc.fl.varBlk[v] = b
+	}
+}
+
 // errorf сообщает об ошибке, если точка достижима.
 func (fc *funcChecker) errorf(pos token.Pos, format string, args ...any) {
-	if fc.fl.dead || fc.fl.st.Inconsistent() {
+	if fc.fl.dead || fc.fl.st.Inconsistent() || fc.silent > 0 {
 		return
 	}
 	fc.report(Diagnostic{Pos: pos, Message: fmt.Sprintf(format, args...)})
@@ -109,6 +180,7 @@ func (fc *funcChecker) explain(a, b term) string {
 
 func (fc *funcChecker) prescan(body *ast.BlockStmt) {
 	fc.addrTaken = map[*types.Var]bool{}
+	fc.captured = map[*types.Var]token.Pos{}
 	fc.gotoLabels = map[string]bool{}
 	ast.Inspect(body, func(n ast.Node) bool {
 		switch n := n.(type) {
@@ -130,6 +202,9 @@ func (fc *funcChecker) prescan(body *ast.BlockStmt) {
 				if id, ok := m.(*ast.Ident); ok {
 					if v, ok := fc.info.Uses[id].(*types.Var); ok {
 						fc.addrTaken[v] = true
+						if _, ok := fc.captured[v]; !ok {
+							fc.captured[v] = n.Pos()
+						}
 					}
 				}
 				return true
@@ -270,17 +345,27 @@ func (fc *funcChecker) stmt(s ast.Stmt) {
 			// Сюда можно прийти по goto откуда угодно: забываем всё, что меняется в функции.
 			fc.fl.dead = false
 			fc.havoc(slicesOfMap(fc.fl.cur))
+			for b := range fc.fl.perms {
+				fc.fl.perms[b] = perm{why: "label " + s.Label.Name + " is reachable by goto"}
+			}
+			for b := range fc.fl.content {
+				fc.fl.content[b] = fc.fresh(fc.blocks[b])
+			}
 		}
 		fc.stmt(s.Stmt)
 	case *ast.BranchStmt:
 		fc.fl.dead = true
 	case *ast.GoStmt:
+		// Горутина работает параллельно: права не возвращаются (§12).
+		fc.async = s.Call
 		fc.expr(s.Call)
+		fc.async = nil
 	case *ast.DeferStmt:
 		fc.expr(s.Call)
 	case *ast.SendStmt:
 		fc.expr(s.Chan)
-		fc.expr(s.Value)
+		v := fc.expr(s.Value)
+		fc.escape(v, fc.info.TypeOf(s.Value), fmt.Sprintf("sent to a channel at line %d", fc.line(s.Arrow)), 2)
 	case *ast.EmptyStmt:
 	default:
 		// CaseClause и CommClause обрабатываются в clauses.
@@ -314,6 +399,10 @@ func (fc *funcChecker) assignStmt(s *ast.AssignStmt) {
 	}
 	rhs := fc.values(s.Rhs, len(s.Lhs))
 	for i, l := range s.Lhs {
+		fc.storing = "value"
+		if len(s.Rhs) == len(s.Lhs) {
+			fc.storing = types.ExprString(s.Rhs[i])
+		}
 		fc.assign(l, rhs[i], true)
 	}
 }
@@ -360,6 +449,8 @@ func (fc *funcChecker) declStmt(s *ast.DeclStmt) {
 			} else {
 				fc.fl.cur[v] = fc.zero(v.Type(), name.Pos())
 			}
+			fc.defineVar(v)
+			fc.storeVar(v, name.Pos(), fc.fl.cur[v])
 		}
 	}
 }
@@ -370,12 +461,31 @@ func (fc *funcChecker) assign(lhs ast.Expr, val term, check bool) {
 	switch l := ast.Unparen(lhs).(type) {
 	case *ast.Ident:
 		v := fc.varOf(l)
-		if v == nil || l.Name == "_" || !fc.isLocal(v) {
+		if v == nil || l.Name == "_" {
 			return
 		}
-		// Переменная, на которую может указывать указатель, — это объект:
-		// его индексы менять нельзя.
-		if old, ok := fc.fl.cur[v]; ok && fc.addrTaken[v] && check {
+		stored := fc.storedIn(v, l.Pos())
+		if !fc.isLocal(v) {
+			fc.escape(val, v.Type(), stored, 2)
+			return
+		}
+		if fc.info.Defs[l] != nil {
+			fc.defineVar(v)
+		} else if b, ok := fc.fl.varBlk[v]; ok && check {
+			fc.checkRoot(l.Pos(), l, root{kind: rootBlocks, blocks: []blockID{b}}, true)
+		}
+		if fc.addrTaken[v] {
+			if b, ok := fc.fl.varBlk[v]; ok {
+				fc.storeValue(l.Pos(), b, nil, val, v.Type(), l.Name)
+			} else {
+				fc.escape(val, v.Type(), stored, 2)
+			}
+		}
+		// Переменная, на которую может указывать указатель, — это объект.
+		// Если у неё есть блок, право на запись проверено выше, и запись
+		// переменной целиком атомарна: индексы могут измениться.
+		_, hasBlock := fc.fl.varBlk[v]
+		if old, ok := fc.fl.cur[v]; ok && fc.addrTaken[v] && check && !hasBlock {
 			fc.preserve(l.Pos(), old, val, v.Type(), l.Name)
 		}
 		fc.fl.cur[v] = val
@@ -388,12 +498,27 @@ func (fc *funcChecker) assign(lhs ast.Expr, val term, check bool) {
 		fc.assignField(l, sel.Obj().(*types.Var), val, check)
 	case *ast.StarExpr:
 		p := fc.expr(l.X)
+		if check && !fc.checkPtr(l.Pos(), l, p, true) {
+			return
+		}
+		if info := fc.pointsTo(p); info.exact {
+			fc.storeValue(l.Pos(), info.blocks[0], info.path, val, fc.info.TypeOf(l), types.ExprString(l))
+		} else {
+			fc.escape(val, fc.info.TypeOf(l), fmt.Sprintf("stored through %s at line %d", types.ExprString(l.X), fc.line(l.Pos())), 2)
+		}
+		if info := fc.pointsTo(p); info.exact {
+			// Запись объекта целиком при полном праве атомарна: индексы
+			// могут измениться (§13, решение 4).
+			fc.writeAt(l.Pos(), info.blocks[0], info.path, val, types.ExprString(l))
+			return
+		}
 		if check {
 			fc.preserve(l.Pos(), fc.deref(p), val, fc.info.TypeOf(l), types.ExprString(l))
 		}
 	case *ast.IndexExpr:
 		fc.expr(l.X)
 		fc.expr(l.Index)
+		fc.escape(val, fc.info.TypeOf(l), fmt.Sprintf("stored in %s at line %d", types.ExprString(l), fc.line(l.Pos())), 2)
 	}
 }
 
@@ -401,41 +526,100 @@ func (fc *funcChecker) assign(lhs ast.Expr, val term, check bool) {
 func (fc *funcChecker) assignField(l *ast.SelectorExpr, f *types.Var, val term, check bool) {
 	xt := fc.info.TypeOf(l.X)
 	viaPtr := isPointer(xt)
-	base := fc.expr(l.X)
+	if !viaPtr {
+		fc.noAccess(l.X)
+	}
+	ptr := fc.expr(l.X)
+	base := ptr
 	if viaPtr {
-		base = fc.deref(base)
+		base = fc.deref(ptr)
 	}
 	st := derefType(xt)
+	lhs, x := types.ExprString(l), types.ExprString(l.X)
+	r, dep := fc.memRoot(l), fc.dependentField(st, f)
+	owning := fc.specs.Owning(f) || len(fc.ownPaths(f.Type(), 3)) > 0
+	if check && (dep || owning) && !fc.checkRoot(l.Sel.Pos(), l, r, true) {
+		return
+	}
+	if r.kind != rootValue {
+		b, path, exact := fc.place(l)
+		switch {
+		case !exact && owning && r.kind == rootBlocks:
+			// Во владеющем слоте может лежать только объект региона: место
+			// записи должно быть известно точно.
+			fc.errorf(l.Sel.Pos(), "cannot store %s in %s: %s may point to different objects", fc.storing, lhs, x)
+		case exact && fc.specs.Owning(f):
+			fc.ownStore(l.Sel.Pos(), b, path, val, fc.storing, lhs)
+		case exact && owning:
+			fc.storeValue(l.Sel.Pos(), b, path, val, f.Type(), lhs)
+		default:
+			fc.escape(val, f.Type(), fmt.Sprintf("stored in %s at line %d", lhs, fc.line(l.Pos())), 2)
+		}
+		if !dep {
+			// Независимые поля в памяти и так читаются как свежие термы:
+			// версию блока запись не меняет, права не нужны.
+			return
+		}
+	}
+	if viaPtr {
+		// Запись в известный блок даёт новую версию содержимого (право на
+		// запись проверено выше). Обычные поля через указатель и так
+		// читаются как свежие термы.
+		info := fc.pointsTo(ptr)
+		nb, ok := fc.rebuild(l.Sel.Pos(), base, st, f, val, info.exact, check, lhs, x)
+		if ok && info.exact {
+			fc.writeAt(l.Sel.Pos(), info.blocks[0], info.path, nb, x)
+		}
+		return
+	}
+	nb, ok := fc.rebuild(l.Sel.Pos(), base, st, f, val, true, check, lhs, x)
+	// Ошибочное присваивание не применяем: об ошибке уже сообщили, дальше
+	// рассуждаем о прежнем объекте (иначе ошибки посыплются каскадом).
+	if !ok {
+		return
+	}
+	fc.assign(l.X, nb, check)
+}
+
+// rebuild строит новое значение структуры base типа st, в котором поле f
+// равно val, и проверяет инварианты equals/close. mutable — запись
+// исключительна (значение или блок с полным правом): тогда параметр,
+// который упоминает только поле f, получает новое значение; остальные
+// параметры обязаны сохраниться (§13, решение 4).
+func (fc *funcChecker) rebuild(pos token.Pos, base term, st types.Type, f *types.Var, val term, mutable, check bool, lhs, x string) (term, bool) {
 	ok := true
+	changed := map[*bound.Param]term{}
 	if s := fc.specs.StructOf(st); s != nil && check {
 		for _, fa := range s.Fields {
 			if fa.Var != f {
 				continue
 			}
-			if fa.Equals != nil {
-				ok = fc.prove(l.Sel.Pos(), val, fc.idx(base, fa.Equals),
-					fmt.Sprintf("assignment to %s preserves %s<%s>", types.ExprString(l), types.ExprString(l.X), fa.Equals.Name))
+			if p := fa.Equals; p != nil {
+				if mutable && soleField(s, p) == f {
+					changed[p] = val
+				} else {
+					ok = fc.prove(pos, val, fc.idx(base, p),
+						fmt.Sprintf("assignment to %s preserves %s<%s>", lhs, x, p.Name)) && ok
+				}
 			}
 			if fa.Close != nil {
 				target := fc.specs.Bounded(f.Type())
 				for i, arg := range fa.Close {
-					p := target.Params[i]
-					ok = fc.prove(l.Sel.Pos(), fc.idx(val, p), fc.specTerm(arg, nil, base),
-						fmt.Sprintf("assignment to %s preserves %s<%s> == %s", types.ExprString(l), types.ExprString(l), p.Name, arg)) && ok
+					q := target.Params[i]
+					if sp, self := arg.(*bound.SelfParam); self && mutable && soleField(s, sp.Param) == f {
+						changed[sp.Param] = fc.idx(val, q)
+						continue
+					}
+					ok = fc.prove(pos, fc.idx(val, q), fc.specTerm(arg, nil, base),
+						fmt.Sprintf("assignment to %s preserves %s<%s> == %s", lhs, lhs, q.Name, arg)) && ok
 				}
 			}
 		}
 	}
-	// Ошибочное присваивание не применяем: об ошибке уже сообщили, дальше
-	// рассуждаем о прежнем объекте (иначе ошибки посыплются каскадом).
-	// Через указатель или у переменной с взятым адресом обычные поля и так
-	// читаются как свежие термы — обновлять нечего.
-	root := fc.rootVar(l.X)
-	if !ok || viaPtr || root == nil || fc.addrTaken[root] {
-		return
+	if !ok {
+		return none, false
 	}
-	// Значение-структура: строим новое значение x с изменённым полем f.
-	nb := fc.fresh(types.ExprString(l.X))
+	nb := fc.fresh(x)
 	for g := range st.Underlying().(*types.Struct).Fields() {
 		if g == f {
 			fc.fl.st.AssertEqual(fc.field(nb, g), val)
@@ -445,10 +629,35 @@ func (fc *funcChecker) assignField(l *ast.SelectorExpr, f *types.Var, val term, 
 	}
 	if s := fc.specs.Bounded(st); s != nil {
 		for _, p := range s.Params {
-			fc.fl.st.AssertEqual(fc.idx(nb, p), fc.idx(base, p))
+			if t, ok := changed[p]; ok {
+				fc.fl.st.AssertEqual(fc.idx(nb, p), t)
+			} else {
+				fc.fl.st.AssertEqual(fc.idx(nb, p), fc.idx(base, p))
+			}
 		}
 	}
-	fc.assign(l.X, nb, check)
+	return nb, true
+}
+
+// soleField — единственное поле структуры s, упоминающее параметр p
+// в equals/close, или nil.
+func soleField(s *bound.Struct, p *bound.Param) *types.Var {
+	var only *types.Var
+	n := 0
+	for _, fa := range s.Fields {
+		if fa.Equals == p {
+			n, only = n+1, fa.Var
+		}
+		for _, a := range fa.Close {
+			if sp, ok := a.(*bound.SelfParam); ok && sp.Param == p {
+				n, only = n+1, fa.Var
+			}
+		}
+	}
+	if n != 1 {
+		return nil
+	}
+	return only
 }
 
 // preserve проверяет, что новое значение объекта имеет те же индексы, что и старое.
@@ -460,6 +669,27 @@ func (fc *funcChecker) preserve(pos token.Pos, old, val term, t types.Type, what
 	for _, p := range s.Params {
 		fc.prove(pos, fc.idx(val, p), fc.idx(old, p), fmt.Sprintf("assignment to %s preserves %s<%s>", what, what, p.Name))
 	}
+}
+
+// storeVar — начальное значение переменной: в память переменной с блоком
+// оно записывается (владеющие поля переносят права), иначе утекает.
+func (fc *funcChecker) storeVar(v *types.Var, pos token.Pos, val term) {
+	if !fc.addrTaken[v] {
+		return
+	}
+	if b, ok := fc.fl.varBlk[v]; ok {
+		fc.storeValue(pos, b, nil, val, v.Type(), v.Name())
+		return
+	}
+	fc.escape(val, v.Type(), fc.storedIn(v, pos), 2)
+}
+
+// storedIn — причина потери прав при записи указателя в переменную v.
+func (fc *funcChecker) storedIn(v *types.Var, pos token.Pos) string {
+	if at, ok := fc.captured[v]; ok {
+		return fmt.Sprintf("stored in %s, which is captured by a closure at line %d", v.Name(), fc.line(at))
+	}
+	return fmt.Sprintf("stored in %s at line %d", v.Name(), fc.line(pos))
 }
 
 func (fc *funcChecker) isLocal(v *types.Var) bool {
@@ -488,11 +718,15 @@ func (fc *funcChecker) returnStmt(s *ast.ReturnStmt) {
 			target := fc.specs.Bounded(r.Type)
 			for j, arg := range r.Args {
 				p := target.Params[j]
-				fc.prove(s.Pos(), fc.idx(vals[i], p), fc.specTerm(arg, fc.entry, none),
+				fc.atEntry = true
+				want := fc.specTerm(arg, fc.entry, none)
+				fc.atEntry = false
+				fc.prove(s.Pos(), fc.idx(vals[i], p), want,
 					fmt.Sprintf("result %d satisfies returns: result<%s> == %s", i+1, p.Name, arg))
 			}
 		}
 	}
+	fc.exit(vals)
 	fc.fl.dead = true
 }
 
@@ -554,19 +788,21 @@ func (fc *funcChecker) cond(e ast.Expr) (pos, neg facts) {
 		case token.LAND:
 			p1, _ := fc.cond(e.X)
 			// Правая часть вычисляется, только если левая истинна.
-			saved := fc.fl
+			saved, mark := fc.fl, len(fc.losses)
 			fc.fl = saved.clone()
 			fc.assume(p1)
 			p2, _ := fc.cond(e.Y)
 			fc.fl = saved
+			fc.applyLosses(saved, mark)
 			return p1.and(p2), facts{}
 		case token.LOR:
 			_, n1 := fc.cond(e.X)
-			saved := fc.fl
+			saved, mark := fc.fl, len(fc.losses)
 			fc.fl = saved.clone()
 			fc.assume(n1)
 			_, n2 := fc.cond(e.Y)
 			fc.fl = saved
+			fc.applyLosses(saved, mark)
 			return facts{}, n1.and(n2)
 		}
 	case *ast.UnaryExpr:
@@ -605,7 +841,26 @@ func (fc *funcChecker) join(a, b *flow) *flow {
 		fc.materialize(m, v.Type(), 2)
 		cur[v] = m
 	}
-	return &flow{st: congruence.Join(a.st, b.st), cur: cur}
+	contents := map[blockID]term{}
+	for id, ta := range a.content {
+		tb, ok := b.content[id]
+		switch {
+		case !ok:
+		case ta == tb:
+			contents[id] = ta
+		default:
+			m := fc.fresh(fc.blocks[id])
+			a.st.AssertEqual(m, ta)
+			b.st.AssertEqual(m, tb)
+			fc.materialize(m, fc.blockType[id], 2)
+			contents[id] = m
+		}
+	}
+	out := newFlow(congruence.Join(a.st, b.st))
+	out.cur = cur
+	out.content = contents
+	joinAlias(a, b, out)
+	return out
 }
 
 // materialize создаёт в банке термы индексов и полей значения t типа typ
@@ -636,30 +891,45 @@ func (fc *funcChecker) loop(s ast.Stmt, init ast.Stmt, cond ast.Expr, post ast.S
 	}
 	fc.havoc(fc.assigned(s))
 	after := fc.fl
-	fc.fl = after.clone()
-	if r, ok := s.(*ast.RangeStmt); ok {
-		for _, e := range []ast.Expr{r.Key, r.Value} {
-			if e != nil {
-				fc.assign(e, fc.fresh("range"), false)
+	iteration := func() {
+		fc.fl = after.clone()
+		if r, ok := s.(*ast.RangeStmt); ok {
+			for _, e := range []ast.Expr{r.Key, r.Value} {
+				if e != nil {
+					fc.assign(e, fc.fresh("range"), false)
+				}
 			}
 		}
+		if cond != nil {
+			pos, _ := fc.cond(cond)
+			fc.assume(pos)
+		}
+		fc.stmt(body)
+		fc.fl.dead = false
+		if post != nil {
+			fc.stmt(post)
+		}
 	}
-	if cond != nil {
-		pos, _ := fc.cond(cond)
-		fc.assume(pos)
-	}
-	fc.stmt(body)
-	fc.fl.dead = false
-	if post != nil {
-		fc.stmt(post)
-	}
+	// Права, потерянные на одной итерации, недоступны на следующей и после
+	// цикла; содержимое блоков, записанных в теле, неизвестно. Ни то ни
+	// другое не зависит от прав, поэтому одного пробного прохода хватает,
+	// чтобы найти неподвижную точку (§11.6).
+	mark, wmark := len(fc.losses), len(fc.writes)
+	fc.silent++
+	iteration()
+	fc.silent--
+	fc.applyLosses(after, mark)
+	fc.havocBlocks(after, wmark)
+	fc.losses, fc.writes = fc.losses[:mark], fc.writes[:wmark]
+	iteration()
 	fc.fl = after
+	fc.applyLosses(after, mark)
 }
 
 // clauses — switch/select: каждая ветка проверяется от состояния до switch,
 // после switch переменные, меняющиеся в ветках, забываются.
 func (fc *funcChecker) clauses(s ast.Stmt, body *ast.BlockStmt) {
-	before := fc.fl
+	before, mark, wmark := fc.fl, len(fc.losses), len(fc.writes)
 	for _, cl := range body.List {
 		fc.fl = before.clone()
 		switch cl := cl.(type) {
@@ -679,5 +949,7 @@ func (fc *funcChecker) clauses(s ast.Stmt, body *ast.BlockStmt) {
 		}
 	}
 	fc.fl = before
+	fc.applyLosses(before, mark)
+	fc.havocBlocks(before, wmark)
 	fc.havoc(fc.assigned(s))
 }
