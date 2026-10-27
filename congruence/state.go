@@ -19,6 +19,7 @@ type State struct {
 	parent       []Term   // union-find; parent[t] == none — терм не зарегистрирован
 	uses         [][]Term // для представителя: применения, у которых аргумент в этом классе
 	consts       []Term   // для представителя: константа класса или none
+	excl         [][]Term // для представителя: константы, которым класс не равен
 	sig          map[string]Term
 	inconsistent bool
 }
@@ -34,11 +35,15 @@ func (s *State) Clone() *State {
 		parent:       slices.Clone(s.parent),
 		uses:         make([][]Term, len(s.uses)),
 		consts:       slices.Clone(s.consts),
+		excl:         make([][]Term, len(s.excl)),
 		sig:          maps.Clone(s.sig),
 		inconsistent: s.inconsistent,
 	}
 	for i, u := range s.uses {
 		c.uses[i] = slices.Clone(u)
+	}
+	for i, x := range s.excl {
+		c.excl[i] = slices.Clone(x)
 	}
 	return c
 }
@@ -63,6 +68,36 @@ func (s *State) AreEqual(a, b Term) bool {
 	s.register(a)
 	s.register(b)
 	return s.find(a) == s.find(b)
+}
+
+// AssertDistinct добавляет факт t ≠ c, где c — константа. Других неравенств
+// в состоянии нет. Если t ≈ c уже выведено, состояние противоречиво.
+func (s *State) AssertDistinct(t, c Term) {
+	if !s.bank.IsConst(c) {
+		panic("congruence: AssertDistinct with a non-constant")
+	}
+	s.register(t)
+	s.register(c)
+	r := s.find(t)
+	if r == s.find(c) {
+		s.inconsistent = true
+		return
+	}
+	if !slices.Contains(s.excl[r], c) {
+		s.excl[r] = append(s.excl[r], c)
+	}
+}
+
+// IsDistinct сообщает, выводится ли t ≠ c для константы c: t равен другой
+// константе или t ≠ c утверждено. В противоречивом состоянии выводится всё.
+func (s *State) IsDistinct(t, c Term) bool {
+	if s.inconsistent {
+		return true
+	}
+	if s.AreKnownDistinct(t, c) {
+		return true
+	}
+	return slices.Contains(s.excl[s.find(t)], c)
 }
 
 // AreKnownDistinct сообщает, что a и b равны разным константам, то есть
@@ -111,6 +146,15 @@ func Join(a, b *State) *State {
 			first[key] = t
 		}
 	}
+	// Неравенство t ≠ c остаётся, если выводится в обоих состояниях.
+	for key, t := range first {
+		for _, c := range slices.Concat(a.excl[key[0]], b.excl[key[1]]) {
+			rt := r.find(t)
+			if a.IsDistinct(t, c) && b.IsDistinct(t, c) && !slices.Contains(r.excl[rt], c) {
+				r.excl[rt] = append(r.excl[rt], c)
+			}
+		}
+	}
 	return r
 }
 
@@ -150,6 +194,7 @@ func (s *State) register(t Term) {
 		s.parent = append(s.parent, none)
 		s.uses = append(s.uses, nil)
 		s.consts = append(s.consts, none)
+		s.excl = append(s.excl, nil)
 	}
 	if s.parent[t] != none {
 		return
@@ -207,6 +252,15 @@ func (s *State) merge(a, b Term) {
 		}
 		if cb == none {
 			s.consts[rb] = ca
+		}
+		for _, c := range s.excl[ra] {
+			if !slices.Contains(s.excl[rb], c) {
+				s.excl[rb] = append(s.excl[rb], c)
+			}
+		}
+		s.excl[ra] = nil
+		if c := s.consts[rb]; c != none && slices.Contains(s.excl[rb], c) {
+			s.inconsistent = true
 		}
 		s.parent[ra] = rb
 		// У применений из класса ra изменилась сигнатура: перепроверяем их.

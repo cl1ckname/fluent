@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"go/types"
 	"maps"
+	"slices"
 
 	"fluent/bound"
 	"fluent/congruence"
@@ -28,6 +29,8 @@ type flow struct {
 	// Регионы (own.go).
 	owner    map[blockID]ownerRef // владельцы дочерних блоков
 	children map[slotKey]blockID  // что лежит во владеющих слотах
+
+	deferred []deferredFact // условные ensures после вызовов (ensures.go)
 }
 
 func newFlow(st *congruence.State) *flow {
@@ -39,7 +42,7 @@ func newFlow(st *congruence.State) *flow {
 func (f *flow) clone() *flow {
 	return &flow{st: f.st.Clone(), cur: maps.Clone(f.cur), dead: f.dead,
 		ptrs: maps.Clone(f.ptrs), perms: maps.Clone(f.perms), varBlk: maps.Clone(f.varBlk), content: maps.Clone(f.content),
-		owner: maps.Clone(f.owner), children: maps.Clone(f.children)}
+		owner: maps.Clone(f.owner), children: maps.Clone(f.children), deferred: slices.Clone(f.deferred)}
 }
 
 // funcChecker проверяет одно тело функции.
@@ -55,6 +58,8 @@ type funcChecker struct {
 	captured   map[*types.Var]token.Pos // переменная захвачена замыканием: где
 	gotoLabels map[string]bool
 	nfresh     int
+	targets    []*breakTarget // операторы, из которых выходит break (switch.go)
+	label      string         // метка следующего оператора с break
 
 	// Слой прав (alias.go).
 	terms        map[ast.Expr]term      // последние вычисленные термы выражений
@@ -74,6 +79,11 @@ type funcChecker struct {
 	exited      bool          // уже был выход: результаты сводки сливаются
 	async       *ast.CallExpr // вызов в операторе go
 	storing     string        // текст записываемого значения, для сообщений
+
+	// ensures (ensures.go).
+	deferCall *ast.CallExpr // вызов в операторе defer
+	post      bool          // термы ensures после вызова
+	ndeferred int
 }
 
 // checkFunc проверяет тело и возвращает выведенную сводку.
@@ -130,6 +140,13 @@ func (c *checker) checkFunc(sig *types.Signature, body *ast.BlockStmt, spec *bou
 		}
 	}
 	fc.stmts(body.List)
+	if !fc.fl.dead {
+		var vals []term
+		for v := range sig.Results().Variables() {
+			vals = append(vals, fc.fl.cur[v])
+		}
+		fc.checkEnsures(body.Rbrace, vals)
+	}
 	fc.exit(nil)
 	return fc.finishSummary()
 }
@@ -324,22 +341,8 @@ func (fc *funcChecker) stmt(s ast.Stmt) {
 	case *ast.RangeStmt:
 		fc.expr(s.X)
 		fc.loop(s, nil, nil, nil, s.Body)
-	case *ast.SwitchStmt:
-		if s.Init != nil {
-			fc.stmt(s.Init)
-		}
-		if s.Tag != nil {
-			fc.expr(s.Tag)
-		}
-		fc.clauses(s, s.Body)
-	case *ast.TypeSwitchStmt:
-		if s.Init != nil {
-			fc.stmt(s.Init)
-		}
-		fc.stmt(s.Assign)
-		fc.clauses(s, s.Body)
-	case *ast.SelectStmt:
-		fc.clauses(s, s.Body)
+	case *ast.SwitchStmt, *ast.TypeSwitchStmt, *ast.SelectStmt:
+		fc.clauses(s)
 	case *ast.LabeledStmt:
 		if fc.gotoLabels[s.Label.Name] {
 			// Сюда можно прийти по goto откуда угодно: забываем всё, что меняется в функции.
@@ -352,8 +355,14 @@ func (fc *funcChecker) stmt(s ast.Stmt) {
 				fc.fl.content[b] = fc.fresh(fc.blocks[b])
 			}
 		}
+		if breakable(s.Stmt) {
+			fc.label = s.Label.Name
+		}
 		fc.stmt(s.Stmt)
 	case *ast.BranchStmt:
+		if s.Tok == token.BREAK {
+			fc.breakTo(s.Label)
+		}
 		fc.fl.dead = true
 	case *ast.GoStmt:
 		// Горутина работает параллельно: права не возвращаются (§12).
@@ -361,7 +370,10 @@ func (fc *funcChecker) stmt(s ast.Stmt) {
 		fc.expr(s.Call)
 		fc.async = nil
 	case *ast.DeferStmt:
+		// Отложенный вызов выполнится на выходе: его ensures сейчас неверны.
+		fc.deferCall = s.Call
 		fc.expr(s.Call)
+		fc.deferCall = nil
 	case *ast.SendStmt:
 		fc.expr(s.Chan)
 		v := fc.expr(s.Value)
@@ -726,6 +738,7 @@ func (fc *funcChecker) returnStmt(s *ast.ReturnStmt) {
 			}
 		}
 	}
+	fc.checkEnsures(s.Pos(), vals)
 	fc.exit(vals)
 	fc.fl.dead = true
 }
@@ -751,14 +764,15 @@ func (fc *funcChecker) ifStmt(s *ast.IfStmt) {
 }
 
 // facts — то, что известно из условия: равенства и пары, про которые известно,
-// что они различны. Различия в состоянии не хранятся: они только проверяются
-// в момент assume — если пара уже выведена равной, точка недостижима.
+// что они различны. Различия в состоянии хранятся, только если одна сторона —
+// константа (excl: терм и константа); остальные только проверяются в момент
+// assume — если пара уже выведена равной, точка недостижима.
 type facts struct {
-	eqs, neqs [][2]term
+	eqs, neqs, excl [][2]term
 }
 
 func (f facts) and(g facts) facts {
-	return facts{append(f.eqs, g.eqs...), append(f.neqs, g.neqs...)}
+	return facts{append(f.eqs, g.eqs...), append(f.neqs, g.neqs...), append(f.excl, g.excl...)}
 }
 
 func (fc *funcChecker) assume(f facts) {
@@ -770,6 +784,10 @@ func (fc *funcChecker) assume(f facts) {
 			fc.fl.dead = true
 		}
 	}
+	for _, e := range f.excl {
+		fc.fl.st.AssertDistinct(e[0], e[1])
+	}
+	fc.fire()
 }
 
 // cond вычисляет условие и возвращает факты, верные, когда оно истинно (pos)
@@ -779,8 +797,7 @@ func (fc *funcChecker) cond(e ast.Expr) (pos, neg facts) {
 	case *ast.BinaryExpr:
 		switch e.Op {
 		case token.EQL, token.NEQ:
-			f := facts{eqs: [][2]term{{fc.expr(e.X), fc.expr(e.Y)}}}
-			nf := facts{neqs: f.eqs}
+			f, nf := fc.eqFacts(fc.expr(e.X), fc.expr(e.Y))
 			if e.Op == token.NEQ {
 				return nf, f
 			}
@@ -811,8 +828,20 @@ func (fc *funcChecker) cond(e ast.Expr) (pos, neg facts) {
 			return n, p
 		}
 	}
-	fc.expr(e)
-	return facts{}, facts{}
+	return fc.boolFacts(e, fc.expr(e))
+}
+
+// eqFacts — факты условия x == y: когда оно истинно и когда ложно.
+func (fc *funcChecker) eqFacts(x, y term) (pos, neg facts) {
+	pos = facts{eqs: [][2]term{{x, y}}}
+	neg = facts{neqs: pos.eqs}
+	switch {
+	case fc.bank.IsConst(y):
+		neg.excl = [][2]term{{x, y}}
+	case fc.bank.IsConst(x):
+		neg.excl = [][2]term{{y, x}}
+	}
+	return pos, neg
 }
 
 // join сливает два потока: остаются равенства, верные в обоих.
@@ -859,6 +888,7 @@ func (fc *funcChecker) join(a, b *flow) *flow {
 	out := newFlow(congruence.Join(a.st, b.st))
 	out.cur = cur
 	out.content = contents
+	out.deferred = joinDeferred(a.deferred, b.deferred)
 	joinAlias(a, b, out)
 	return out
 }
@@ -886,6 +916,8 @@ func (fc *funcChecker) materialize(t term, typ types.Type, depth int) {
 // loop — консервативно: переменные, которые меняются в цикле, забываются;
 // тело проверяется один раз, а после цикла известно только то, что было до него.
 func (fc *funcChecker) loop(s ast.Stmt, init ast.Stmt, cond ast.Expr, post ast.Stmt, body *ast.BlockStmt) {
+	fc.pushTarget(true)
+	defer fc.popTarget()
 	if init != nil {
 		fc.stmt(init)
 	}
@@ -924,32 +956,4 @@ func (fc *funcChecker) loop(s ast.Stmt, init ast.Stmt, cond ast.Expr, post ast.S
 	iteration()
 	fc.fl = after
 	fc.applyLosses(after, mark)
-}
-
-// clauses — switch/select: каждая ветка проверяется от состояния до switch,
-// после switch переменные, меняющиеся в ветках, забываются.
-func (fc *funcChecker) clauses(s ast.Stmt, body *ast.BlockStmt) {
-	before, mark, wmark := fc.fl, len(fc.losses), len(fc.writes)
-	for _, cl := range body.List {
-		fc.fl = before.clone()
-		switch cl := cl.(type) {
-		case *ast.CaseClause:
-			for _, e := range cl.List {
-				fc.expr(e)
-			}
-			if obj, ok := fc.info.Implicits[cl].(*types.Var); ok {
-				fc.fl.cur[obj] = fc.fresh(obj.Name())
-			}
-			fc.stmts(cl.Body)
-		case *ast.CommClause:
-			if cl.Comm != nil {
-				fc.stmt(cl.Comm)
-			}
-			fc.stmts(cl.Body)
-		}
-	}
-	fc.fl = before
-	fc.applyLosses(before, mark)
-	fc.havocBlocks(before, wmark)
-	fc.havoc(fc.assigned(s))
 }

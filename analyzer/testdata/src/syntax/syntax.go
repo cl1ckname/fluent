@@ -6,5 +6,8 @@ type amount struct {
 	currency string
 }
 
-/*@ ensures a == b; */ // want `unknown clause "ensures"`
-func f(a, b amount)    {}
+/*@ ensure a == b; */ // want `unknown clause "ensure"`
+func f(a, b amount)   {}
+
+/*@ ensures a != b; */ // want `'!=' is only allowed in an ensures condition`
+func g(a, b amount)    {}

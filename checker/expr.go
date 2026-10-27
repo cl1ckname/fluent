@@ -40,6 +40,8 @@ func (fc *funcChecker) constant(v constant.Value) term {
 
 func (fc *funcChecker) nilTerm() term { return fc.bank.Const("nil") }
 
+func (fc *funcChecker) boolTerm(b bool) term { return fc.constant(constant.MakeBool(b)) }
+
 // ---- выражения ----
 
 // expr вычисляет терм значения выражения (и проверяет вызовы внутри него).
@@ -86,6 +88,7 @@ func (fc *funcChecker) eval(e ast.Expr) term {
 			x := fc.expr(e.X)
 			p := fc.fresh("&" + types.ExprString(e.X))
 			fc.fl.st.AssertEqual(fc.deref(p), x)
+			fc.fl.st.AssertDistinct(p, fc.nilTerm())
 			fc.addrOf(p, e.X)
 			return p
 		}
@@ -214,13 +217,17 @@ func (fc *funcChecker) specTerm(e bound.Expr, vars map[*types.Var]term, self ter
 		x := fc.specTerm(e.X, vars, self)
 		t := e.X.Type()
 		if isPointer(t) {
-			return fc.fieldRead(fc.deref(x), derefType(t), e.Field, false)
+			ft := fc.fieldRead(fc.specDeref(x), derefType(t), e.Field, false)
+			if fc.specs.Owning(e.Field) {
+				fc.ownLoad(x, e.Field, ft)
+			}
+			return ft
 		}
 		return fc.fieldRead(x, t, e.Field, true)
 	case *bound.ParamOf:
 		x := fc.specTerm(e.X, vars, self)
 		if isPointer(e.X.Type()) {
-			x = fc.deref(x)
+			x = fc.specDeref(x)
 		}
 		return fc.idx(x, e.Param)
 	case *bound.SelfParam:
@@ -342,6 +349,9 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 			fc.fl.ptrs[results[0]] = ptrInfo{blocks: []blockID{b}, dependent: true}
 		}
 	}
+	if len(results) == 1 && (fc.isBuiltin(fun, "new") || nonNilResult(fn)) {
+		fc.fl.st.AssertDistinct(results[0], fc.nilTerm())
+	}
 	if spec != nil && spec.Returns != nil {
 		for i, r := range spec.Returns {
 			if r.Args == nil {
@@ -364,6 +374,11 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 		for i := sig.Params().Len() - 1; i < len(args); i++ {
 			fc.escape(argTerms[i], fc.info.TypeOf(args[i]), why, 2)
 		}
+	}
+	// ensures — после правила вызова: память уже в новых версиях. Вызовы
+	// в go и defer выполнятся позже, их постусловия здесь неверны.
+	if spec != nil && len(spec.Ensures) > 0 && call != fc.async && call != fc.deferCall {
+		fc.applyEnsures(spec, vars, results)
 	}
 	return results
 }

@@ -22,9 +22,11 @@ const (
 	kDot   // .
 	kEq    // ==
 	kAnd   // &&
+	kNeq   // !=
+	kImpl  // ==>
 )
 
-var kindNames = [...]string{"end of spec", "identifier", "literal", "'<'", "'>'", "','", "';'", "'.'", "'=='", "'&&'"}
+var kindNames = [...]string{"end of spec", "identifier", "literal", "'<'", "'>'", "','", "';'", "'.'", "'=='", "'&&'", "'!='", "'==>'"}
 
 func (k kind) String() string { return kindNames[k] }
 
@@ -127,8 +129,15 @@ func punct(s string) (kind, int) {
 	case '.':
 		return kDot, 1
 	case '=':
+		if strings.HasPrefix(s, "==>") {
+			return kImpl, 3
+		}
 		if len(s) > 1 && s[1] == '=' {
 			return kEq, 2
+		}
+	case '!':
+		if len(s) > 1 && s[1] == '=' {
+			return kNeq, 2
 		}
 	case '&':
 		if len(s) > 1 && s[1] == '&' {

@@ -134,6 +134,25 @@ type Func struct {
 	Obj      *types.Func
 	Requires []Equality
 	Returns  []Result // nil, если returns нет; иначе по одному на каждый результат
+	Ensures  []Ensure
+}
+
+// Ensure — клауза ensures: если Guard верно на выходе (или Guard == nil),
+// то верны Eqs. Термы Eqs берутся на выходе; Var результата —
+// возвращаемое значение.
+type Ensure struct {
+	Pos   token.Pos
+	Guard *Guard
+	Eqs   []Equality
+}
+
+// Guard — условие клаузы: результат Result (позиция Index) равен
+// (Neq — не равен) константе Value.
+type Guard struct {
+	Result *types.Var
+	Index  int
+	Neq    bool
+	Value  *Const
 }
 
 // Result — тип результата. Args == nil: индекс неизвестен (или тип не bounded).
@@ -205,6 +224,26 @@ func (e *FieldOf) String() string   { return e.X.String() + "." + e.Field.Name()
 func (e *ParamOf) String() string   { return e.X.String() + "<" + e.Param.Name + ">" }
 func (e *SelfParam) String() string { return e.Param.Name }
 
+func (g *Guard) String() string {
+	op := " == "
+	if g.Neq {
+		op = " != "
+	}
+	return g.Result.Name() + op + g.Value.String()
+}
+
+func (e Ensure) String() string {
+	es := make([]string, len(e.Eqs))
+	for i, eq := range e.Eqs {
+		es[i] = eq.String()
+	}
+	g := ""
+	if e.Guard != nil {
+		g = e.Guard.String() + " ==> "
+	}
+	return g + strings.Join(es, " && ")
+}
+
 func (e Equality) String() string { return e.Left.String() + " == " + e.Right.String() }
 
 func (s *Struct) String() string {
@@ -239,6 +278,9 @@ func (f *Func) String() string {
 			rs[i] = r.format(f.Obj.Pkg())
 		}
 		parts = append(parts, "returns "+strings.Join(rs, ", "))
+	}
+	for _, e := range f.Ensures {
+		parts = append(parts, "ensures "+e.String())
 	}
 	return f.Obj.Name() + ": " + strings.Join(parts, "; ")
 }

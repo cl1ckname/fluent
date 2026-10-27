@@ -262,3 +262,59 @@ func TestMoneyExample(t *testing.T) {
 		t.Error("unknown currency: neither provable nor refuted")
 	}
 }
+
+func TestDistinct(t *testing.T) {
+	b := NewBank()
+	x, y, fx := b.Atom("x"), b.Atom("y"), b.App("f", b.Atom("x"))
+	null, one := b.Const("nil"), b.Const("1")
+	s := NewState(b)
+	if s.IsDistinct(x, null) {
+		t.Error("nothing is known yet")
+	}
+	s.AssertDistinct(x, null)
+	if !s.IsDistinct(x, null) || s.IsDistinct(y, null) {
+		t.Error("x ≠ nil only")
+	}
+	// Неравенство переходит к классу.
+	s.AssertEqual(y, x)
+	if !s.IsDistinct(y, null) {
+		t.Error("y ≈ x ≠ nil")
+	}
+	s.AssertEqual(fx, one)
+	if !s.IsDistinct(fx, null) {
+		t.Error("a different constant is distinct")
+	}
+	c := s.Clone()
+	c.AssertEqual(y, null)
+	if !c.Inconsistent() || s.Inconsistent() {
+		t.Error("x ≠ nil and x ≈ nil must contradict only in the clone")
+	}
+	d := NewState(b)
+	d.AssertEqual(x, null)
+	d.AssertDistinct(x, null)
+	if !d.Inconsistent() {
+		t.Error("asserting x ≠ nil after x ≈ nil must contradict")
+	}
+}
+
+func TestJoinDistinct(t *testing.T) {
+	b := NewBank()
+	x, y, z := b.Atom("x"), b.Atom("y"), b.Atom("z")
+	null, one := b.Const("nil"), b.Const("1")
+	s1, s2 := NewState(b), NewState(b)
+	s1.AssertDistinct(x, null)
+	s2.AssertDistinct(x, null)
+	s1.AssertDistinct(y, null)
+	s2.AssertEqual(z, one)
+	s1.AssertDistinct(z, null)
+	j := Join(s1, s2)
+	if !j.IsDistinct(x, null) {
+		t.Error("x ≠ nil holds in both")
+	}
+	if j.IsDistinct(y, null) {
+		t.Error("y ≠ nil holds only in s1")
+	}
+	if !j.IsDistinct(z, null) {
+		t.Error("z ≠ nil: asserted in s1, z ≈ 1 in s2")
+	}
+}

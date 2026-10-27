@@ -87,6 +87,10 @@ func (r *rate) convert(a amount) (amount, []byte, time.Duration) { return a, nil
 // @ requires w.main<c> == w.tax<c> && a<c> == RUB;
 //@ returns wallet;
 func deposit(w wallet, a amount) wallet { return w }
+
+//@ ensures err == nil ==> res<c> == c;
+//@ ensures res<c> == w<c>;
+func parse(c Currency, w *wallet) (res amount, err error) { return }
 `
 
 func TestResolveMoney(t *testing.T) {
@@ -115,6 +119,7 @@ func TestResolveMoney(t *testing.T) {
 		"convert: requires a<c> == r<from>; returns amount<r<to>>, []byte, time.Duration",
 		"deposit: requires w.main<c> == w.tax<c>; requires a<c> == RUB; returns wallet",
 		"newAmount: returns amount<c>",
+		"parse: ensures err == nil ==> res<c> == c; ensures res<c> == w<c>",
 		"sum: requires a<c> == b<c>; returns amount<a<c>>",
 	}
 	if !slices.Equal(structs, wantStructs) {
@@ -172,6 +177,12 @@ type amount struct {
 		{"//@ returns _<\"a\">;\nfunc f() string { return \"\" }", "_ cannot have arguments"},
 		{"//@ returns amount<b>;\nfunc f(a string) amount { return amount{} }", "undefined: b"},
 		{"//@ returns amount; returns amount;\nfunc f() amount { return amount{} }", "duplicate returns"},
+		{"//@ ensures r<c> == \"a\";\nfunc f() amount { return amount{} }", "undefined: r"},
+		{"//@ ensures a == nil ==> r<c> == \"a\";\nfunc f(a *amount) (r amount) { return }", "a is a parameter"},
+		{"//@ ensures e == nil ==> r<c> == \"a\";\nfunc f() (r amount) { return }", "undefined: e"},
+		{"//@ ensures ok == a<c> ==> r<c> == \"a\";\nfunc f(a amount) (r amount, ok string) { return }", "a<c> is not a constant"},
+		{"//@ ensures ok == 1 ==> r<c> == \"a\";\nfunc f() (r amount, ok bool) { return }", "mismatched types bool and untyped int"},
+		{"//@ ensures r.currency == \"a\";\nfunc f() (r amount) { return }", "ensures compares only bound parameters"},
 	}
 	for _, tt := range tests {
 		_, errs := resolveSource(t, prelude+tt.src)

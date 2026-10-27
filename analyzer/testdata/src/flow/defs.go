@@ -15,9 +15,8 @@ func newAmount(c Currency, v float64) amount {
 }
 
 // @ requires a<c> == b<c>;
-// @ requires a.currency == b.currency;
-// @ returns r: r.currency == a.currency;
-func (a amount) sum(b amount) (r amount) {
+// @ returns amount<a<c>>;
+func (a amount) sum(b amount) amount {
 	return amount{currency: a.currency, value: a.value + b.value}
 }
 
@@ -27,7 +26,6 @@ func (a *amount) add(b amount) {
 }
 
 // @ bound <c Currency>;
-// @ preserves self.main.currency == self.reserve.currency
 type wallet struct {
 	// @ close <c>;
 	main amount

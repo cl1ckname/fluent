@@ -6,6 +6,7 @@ import (
 	"go/constant"
 	"go/token"
 	"go/types"
+	"maps"
 
 	"fluent/spec"
 )
@@ -142,6 +143,8 @@ func keyword(c spec.Clause) string {
 		return "requires"
 	case *spec.Returns:
 		return "returns"
+	case *spec.Ensures:
+		return "ensures"
 	}
 	panic("unreachable")
 }
@@ -307,9 +310,13 @@ func (r *resolver) resolveFunc(d *funcDecl) {
 		switch c := c.(type) {
 		case *spec.Requires:
 			for _, eq := range c.Eqs {
-				if e, ok := r.equality(sc, eq); ok {
+				if e, ok := r.equality(sc, eq, "requires"); ok {
 					fn.Requires = append(fn.Requires, e)
 				}
+			}
+		case *spec.Ensures:
+			if e, ok := r.ensures(sc, sig, c); ok {
+				fn.Ensures = append(fn.Ensures, e)
 			}
 		case *spec.Returns:
 			if returns != nil {
@@ -322,31 +329,36 @@ func (r *resolver) resolveFunc(d *funcDecl) {
 			r.errorf(c.Pos(), "%s is not allowed on a function", keyword(c))
 		}
 	}
-	if len(fn.Requires) > 0 || fn.Returns != nil {
+	if len(fn.Requires) > 0 || fn.Returns != nil || len(fn.Ensures) > 0 {
 		r.out.Funcs[d.obj] = fn
 	}
 }
 
-// equality разрешает равенство из requires. В v0 сравниваются только индексы:
-// каждая сторона — `x<p>` или константа, и хотя бы одна сторона — индекс.
+// equality разрешает равенство из requires или ensures (kw). В v0
+// сравниваются только индексы: каждая сторона — `x<p>` или константа,
+// и хотя бы одна сторона — индекс.
 // Индексы comparable по построению, поэтому отдельная проверка не нужна.
-func (r *resolver) equality(sc *scope, eq spec.Equality) (Equality, bool) {
+func (r *resolver) equality(sc *scope, eq spec.Equality, kw string) (Equality, bool) {
 	l, rr := r.term(sc, eq.Left), r.term(sc, eq.Right)
 	if l == nil || rr == nil {
 		return Equality{}, false
 	}
-	_, lIdx := l.(*ParamOf)
-	_, rIdx := rr.(*ParamOf)
+	lIdx, rIdx := isIndex(l), isIndex(rr)
 	for _, e := range []Expr{l, rr} {
-		switch e.(type) {
-		case *ParamOf, *Const:
-		default:
-			r.errorf(e.Pos(), "requires compares only bound parameters: %s is not x<p> or a constant", e)
+		// В ensures, как в returns, индекс можно сравнить с параметром
+		// целиком: его значение — то, что передал вызывающий.
+		if v, ok := e.(*Var); ok && kw == "ensures" {
+			if _, isResult := sc.results[v.Obj]; !isResult {
+				continue
+			}
+		}
+		if _, ok := e.(*Const); !ok && !isIndex(e) {
+			r.errorf(e.Pos(), "%s compares only bound parameters: %s is not x<p> or a constant", kw, e)
 			return Equality{}, false
 		}
 	}
 	if !lIdx && !rIdx {
-		r.errorf(eq.Left.Pos(), "requires compares only bound parameters: %s == %s has none", l, rr)
+		r.errorf(eq.Left.Pos(), "%s compares only bound parameters: %s == %s has none", kw, l, rr)
 		return Equality{}, false
 	}
 	lt, rt := l.Type(), rr.Type()
@@ -355,6 +367,65 @@ func (r *resolver) equality(sc *scope, eq spec.Equality) (Equality, bool) {
 		return Equality{}, false
 	}
 	return Equality{Left: l, Right: rr}, true
+}
+
+func isIndex(e Expr) bool {
+	_, ok := e.(*ParamOf)
+	return ok
+}
+
+// ensures разрешает клаузу ensures. В ней видны именованные результаты
+// (значения на выходе).
+func (r *resolver) ensures(sc *scope, sig *types.Signature, c *spec.Ensures) (Ensure, bool) {
+	esc := &scope{file: sc.file, vars: maps.Clone(sc.vars), results: map[*types.Var]int{}}
+	for i := range sig.Results().Len() {
+		v := sig.Results().At(i)
+		if v.Name() != "" && v.Name() != "_" {
+			esc.vars[v.Name()] = v
+			esc.results[v] = i
+		}
+	}
+	e := Ensure{Pos: c.Pos()}
+	ok := true
+	if g := c.Guard; g != nil {
+		e.Guard, ok = r.guard(esc, g)
+	}
+	for _, eq := range c.Eqs {
+		if q, qok := r.equality(esc, eq, "ensures"); qok {
+			e.Eqs = append(e.Eqs, q)
+		} else {
+			ok = false
+		}
+	}
+	return e, ok
+}
+
+func (r *resolver) guard(sc *scope, g *spec.Guard) (*Guard, bool) {
+	name := g.Result.Name
+	v := sc.vars[name]
+	i, isResult := sc.results[v]
+	switch {
+	case v == nil:
+		r.errorf(g.Result.At, "undefined: %s (ensures condition must compare a named result)", name)
+		return nil, false
+	case !isResult:
+		r.errorf(g.Result.At, "ensures condition must compare a named result, %s is a parameter", name)
+		return nil, false
+	}
+	val := r.term(sc, g.Value)
+	if val == nil {
+		return nil, false
+	}
+	c, ok := val.(*Const)
+	if !ok {
+		r.errorf(val.Pos(), "ensures condition compares %s with a constant, %s is not a constant", name, val)
+		return nil, false
+	}
+	if !types.AssignableTo(c.Type(), v.Type()) {
+		r.errorf(val.Pos(), "mismatched types %s and %s in %s", r.typeString(v.Type()), r.typeString(c.Type()), g)
+		return nil, false
+	}
+	return &Guard{Result: v, Index: i, Neq: g.Neq, Value: c}, true
 }
 
 func (r *resolver) returns(sc *scope, sig *types.Signature, c *spec.Returns) []Result {
@@ -429,6 +500,8 @@ type scope struct {
 	vars map[string]*types.Var
 	self *Struct
 	used map[*Param]bool
+
+	results map[*types.Var]int // именованные результаты и их позиции (в ensures)
 }
 
 func (r *resolver) term(sc *scope, t spec.Term) Expr {

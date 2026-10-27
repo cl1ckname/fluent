@@ -119,6 +119,8 @@ func (p *parser) clause() (c Clause, err *Error) {
 		c = p.requires(kw.pos)
 	case "returns":
 		c = p.returns(kw.pos)
+	case "ensures":
+		c = p.ensures(kw.pos)
 	default:
 		p.fail(kw.pos, "unknown clause %q", kw.text)
 	}
@@ -151,15 +153,54 @@ func (p *parser) bound(at token.Pos) *Bound {
 }
 
 func (p *parser) requires(at token.Pos) *Requires {
-	r := &Requires{At: at}
+	return &Requires{At: at, Eqs: p.eqs(nil)}
+}
+
+// eqs: eq ('&&' eq)*; first — уже разобранное первое равенство.
+func (p *parser) eqs(first *Equality) []Equality {
+	var out []Equality
+	if first != nil {
+		out = append(out, *first)
+		if !p.got(kAnd) {
+			return out
+		}
+	}
 	for {
 		l := p.term()
 		p.expect(kEq)
-		r.Eqs = append(r.Eqs, Equality{Left: l, Right: p.term()})
+		out = append(out, Equality{Left: l, Right: p.term()})
 		if !p.got(kAnd) {
-			return r
+			return out
 		}
 	}
+}
+
+// ensures [ident ('=='|'!=') term '==>'] eq ('&&' eq)*. Первый атом —
+// условие, если за ним идёт '==>'.
+func (p *parser) ensures(at token.Pos) *Ensures {
+	e := &Ensures{At: at}
+	l := p.term()
+	op := p.peek()
+	if op.kind != kNeq {
+		p.expect(kEq)
+	} else {
+		p.next()
+	}
+	r := p.term()
+	if !p.got(kImpl) {
+		if op.kind == kNeq {
+			p.fail(op.pos, "'!=' is only allowed in an ensures condition")
+		}
+		e.Eqs = p.eqs(&Equality{Left: l, Right: r})
+		return e
+	}
+	path, ok := l.(*Path)
+	if !ok || len(path.Steps) > 0 {
+		p.fail(l.Pos(), "ensures condition must compare a named result, found %s", l)
+	}
+	e.Guard = &Guard{Result: path.Root, Neq: op.kind == kNeq, Value: r}
+	e.Eqs = p.eqs(nil)
+	return e
 }
 
 func (p *parser) returns(at token.Pos) *Returns {

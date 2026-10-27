@@ -48,6 +48,21 @@ type Returns struct {
 	Results []ResultType
 }
 
+// Ensures: `ensures [g ==>] e1 == e2 && ...;` — у функции: постусловие
+// о состоянии в момент возврата, при условии g на результат.
+type Ensures struct {
+	At    token.Pos
+	Guard *Guard // nil — без условия
+	Eqs   []Equality
+}
+
+// Guard — условие ensures: `r == c` или `r != c`, r — именованный результат.
+type Guard struct {
+	Result Ident
+	Neq    bool
+	Value  Term
+}
+
 // ResultType — тип результата. Args == nil означает, что индекс неизвестен.
 type ResultType struct {
 	Type TypeName
@@ -100,6 +115,7 @@ func (c *Equals) Pos() token.Pos   { return c.At }
 func (c *Close) Pos() token.Pos    { return c.At }
 func (c *Requires) Pos() token.Pos { return c.At }
 func (c *Returns) Pos() token.Pos  { return c.At }
+func (c *Ensures) Pos() token.Pos  { return c.At }
 func (t *Path) Pos() token.Pos     { return t.Root.At }
 func (t *Lit) Pos() token.Pos      { return t.At }
 
@@ -108,6 +124,7 @@ func (*Equals) clause()   {}
 func (*Close) clause()    {}
 func (*Requires) clause() {}
 func (*Returns) clause()  {}
+func (*Ensures) clause()  {}
 func (*Path) term()       {}
 func (*Lit) term()        {}
 
@@ -137,6 +154,26 @@ func (c *Returns) String() string {
 		rs[i] = r.String()
 	}
 	return "returns " + strings.Join(rs, ", ") + ";"
+}
+
+func (c *Ensures) String() string {
+	es := make([]string, len(c.Eqs))
+	for i, e := range c.Eqs {
+		es[i] = e.String()
+	}
+	g := ""
+	if c.Guard != nil {
+		g = c.Guard.String() + " ==> "
+	}
+	return "ensures " + g + strings.Join(es, " && ") + ";"
+}
+
+func (g *Guard) String() string {
+	op := " == "
+	if g.Neq {
+		op = " != "
+	}
+	return g.Result.Name + op + g.Value.String()
 }
 
 func (r ResultType) String() string {

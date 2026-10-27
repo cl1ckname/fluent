@@ -90,6 +90,18 @@ func (fc *funcChecker) childAt(b blockID, path []*types.Var, elem types.Type) bl
 	return c
 }
 
+// ownLoad — t = x.f для владеющего поля f в терме спецификации: указатель
+// на дочерний блок слота (OWNLOAD), если x указывает в известное место.
+func (fc *funcChecker) ownLoad(x term, f *types.Var, t term) {
+	if fc.atEntry {
+		return
+	}
+	if info := fc.pointsTo(x); info.exact {
+		c := fc.childAt(info.blocks[0], append(slices.Clone(info.path), f), derefType(f.Type()))
+		fc.fl.ptrs[t] = ptrInfo{blocks: []blockID{c}, dependent: true}
+	}
+}
+
 // detachChildren — дочерние блоки b в состоянии f отсоединяются: что лежит
 // в слотах b, больше неизвестно, а у отсоединённых блоков нет прав.
 func (fc *funcChecker) detachChildren(f *flow, b blockID) {
