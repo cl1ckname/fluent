@@ -15,6 +15,21 @@ type Info struct {
 	Funcs   map[*types.Func]*Func
 }
 
+// Declares сообщает, есть ли спецификации объявлений пакета pkg.
+func (in *Info) Declares(pkg *types.Package) bool {
+	for obj := range in.Structs {
+		if obj.Pkg() == pkg {
+			return true
+		}
+	}
+	for obj := range in.Funcs {
+		if obj.Pkg() == pkg {
+			return true
+		}
+	}
+	return false
+}
+
 // StructOf возвращает спецификацию именованного типа t, если она есть.
 func (in *Info) StructOf(t types.Type) *Struct {
 	n, ok := types.Unalias(t).(*types.Named)

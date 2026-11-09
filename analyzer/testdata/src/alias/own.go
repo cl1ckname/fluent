@@ -1,8 +1,5 @@
 package alias
 
-// Этап 4: владеющие поля и регионы (§11.10). Order.Acc — владеющее поле:
-// указатель на тип с зависимыми полями.
-
 // @ requires a<s> == StatusActive;
 func Charge(a *Account) {}
 

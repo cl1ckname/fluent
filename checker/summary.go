@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/types"
+	"maps"
 	"slices"
 	"strings"
 )
@@ -181,6 +182,9 @@ func (c *checker) recursive(comp []funcDecl) bool {
 // summarize выводит сводки всех функций пакета (молча).
 func (c *checker) summarize(funcs []funcDecl) {
 	c.summaries = map[*types.Func]*summary{}
+	if c.pkg.Imports != nil {
+		maps.Copy(c.summaries, c.pkg.Imports.summaries)
+	}
 	c.silent++
 	defer func() { c.silent-- }()
 	for _, comp := range c.sccs(funcs) {
@@ -365,7 +369,7 @@ func (fc *funcChecker) applyCall(call *ast.CallExpr, fn *types.Func, params []*t
 	if s == nil {
 		return false
 	}
-	name := fn.Name()
+	name := fc.funcName(fn)
 	type demand struct {
 		write bool
 		args  []string

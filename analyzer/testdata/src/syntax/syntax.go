@@ -1,4 +1,4 @@
-package syntax
+package syntax // want package:"structs \\[\\] contracts \\[\\]"
 
 /*@ bound <c>; */ // want "missing type for parameter c"
 type amount struct {

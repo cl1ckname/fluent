@@ -1,4 +1,4 @@
-package money
+package money // want package:"structs \\[amount rate wallet\\] contracts \\[amount.sum newAmount rate.convert\\]"
 
 // @ bound <c string>;
 type amount struct {

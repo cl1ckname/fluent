@@ -11,21 +11,39 @@ import (
 	"fluent/spec"
 )
 
+// Objects — откуда резолвер берёт объекты объявлений и области видимости
+// файлов. Для исходников пакета это types.Info (InfoObjects); позже — файлы
+// аннотаций чужих пакетов, где объекты сопоставляются по именам.
+type Objects interface {
+	Def(id *ast.Ident) types.Object     // объект, объявленный идентификатором
+	FileScope(f *ast.File) *types.Scope // импорты файла
+}
+
+// InfoObjects — объекты проверенного пакета из types.Info.
+func InfoObjects(info *types.Info) Objects { return infoObjects{info} }
+
+type infoObjects struct{ info *types.Info }
+
+func (o infoObjects) Def(id *ast.Ident) types.Object     { return o.info.Defs[id] }
+func (o infoObjects) FileScope(f *ast.File) *types.Scope { return o.info.Scopes[f] }
+
 // Resolve разбирает спецификации пакета, связывает их с go/types и проверяет.
 // Все ошибки (синтаксис и смысл) передаются в report; ошибочные инструкции
-// в Info не попадают.
-//
-// TODO: bounded-типы из других пакетов (через analysis.Fact). Сейчас они
-// считаются типами без параметров.
-func Resolve(files []*ast.File, pkg *types.Package, info *types.Info, report func(token.Pos, string)) *Info {
+// в Info не попадают. imports — спецификации зависимостей (может быть nil);
+// результат содержит и их, и спецификации пакета.
+func Resolve(files []*ast.File, pkg *types.Package, objs Objects, imports *Info, report func(token.Pos, string)) *Info {
 	r := &resolver{
 		pkg:    pkg,
-		info:   info,
+		objs:   objs,
 		report: report,
 		out: &Info{
 			Structs: map[*types.TypeName]*Struct{},
 			Funcs:   map[*types.Func]*Func{},
 		},
+	}
+	if imports != nil {
+		maps.Copy(r.out.Structs, imports.Structs)
+		maps.Copy(r.out.Funcs, imports.Funcs)
 	}
 	for _, f := range files {
 		r.collect(f)
@@ -44,7 +62,7 @@ func Resolve(files []*ast.File, pkg *types.Package, info *types.Info, report fun
 
 type resolver struct {
 	pkg    *types.Package
-	info   *types.Info
+	objs   Objects
 	report func(token.Pos, string)
 	out    *Info
 
@@ -89,7 +107,7 @@ func (r *resolver) collect(file *ast.File) {
 	for _, decl := range file.Decls {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
-			obj, _ := r.info.Defs[d.Name].(*types.Func)
+			obj, _ := r.objs.Def(d.Name).(*types.Func)
 			if cs := r.parse(d.Doc); len(cs) > 0 && obj != nil {
 				r.funcs = append(r.funcs, &funcDecl{file: file, obj: obj, clauses: cs})
 			}
@@ -110,7 +128,7 @@ func (r *resolver) collectType(file *ast.File, gd *ast.GenDecl, ts *ast.TypeSpec
 	if !gd.Lparen.IsValid() {
 		doc = gd.Doc
 	}
-	obj, _ := r.info.Defs[ts.Name].(*types.TypeName)
+	obj, _ := r.objs.Def(ts.Name).(*types.TypeName)
 	d := &typeDecl{file: file, obj: obj, clauses: r.parse(doc), used: map[*Param]bool{}}
 	if st, ok := ts.Type.(*ast.StructType); ok {
 		d.st = st
@@ -240,7 +258,7 @@ func (r *resolver) resolveFields(d *typeDecl) {
 			continue
 		}
 		for _, name := range fd.field.Names {
-			v, _ := r.info.Defs[name].(*types.Var)
+			v, _ := r.objs.Def(name).(*types.Var)
 			if v == nil {
 				continue
 			}
@@ -623,7 +641,7 @@ func (r *resolver) lookup(file *ast.File, name string) types.Object {
 	if obj := r.pkg.Scope().Lookup(name); obj != nil {
 		return obj
 	}
-	if fs := r.info.Scopes[file]; fs != nil {
+	if fs := r.objs.FileScope(file); fs != nil {
 		if obj := fs.Lookup(name); obj != nil {
 			return obj
 		}

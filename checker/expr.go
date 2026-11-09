@@ -273,8 +273,9 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 	var sig *types.Signature
 	if fn != nil {
 		sig = fn.Type().(*types.Signature)
-	} else if s, ok := tv.Type.(*types.Signature); ok {
-		sig = s // вызов значения-функции: контракта нет
+	} else if tv.Type != nil {
+		// Вызов значения-функции, в том числе именованного типа: контракта нет.
+		sig, _ = tv.Type.Underlying().(*types.Signature)
 	}
 
 	vars := map[*types.Var]term{}
@@ -325,6 +326,9 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 		spec = fc.specs.Funcs[fn.Origin()]
 	}
 	if spec != nil {
+		if why, ok := fc.unproven[fn.Origin()]; ok {
+			fc.errorf(call.Lparen, "contract of %s is not proven in its package: %s", fc.funcName(fn), why)
+		}
 		for _, eq := range spec.Requires {
 			l, r := fc.specTerm(eq.Left, vars, none), fc.specTerm(eq.Right, vars, none)
 			fc.prove(call.Lparen, l, r, render(eq.Left, names)+" == "+render(eq.Right, names))
@@ -333,7 +337,7 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 
 	calleeName := types.ExprString(call.Fun)
 	if fn != nil {
-		calleeName = fn.Name()
+		calleeName = fc.funcName(fn)
 	}
 	if sig == nil {
 		fc.escapeCall(call, fn, calleeName, recvTerm, recvType, args, argTerms)

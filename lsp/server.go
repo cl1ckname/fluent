@@ -34,6 +34,7 @@ type server struct {
 	documents   map[string]document
 	pending     map[string]time.Time
 	published   map[string]map[string]bool // каталог -> файлы с опубликованными диагностиками
+	dirty       map[string]bool            // документы с правками после последнего сохранения
 	generation  uint64
 	active      context.CancelFunc
 	activeDir   string
@@ -45,7 +46,7 @@ type server struct {
 
 func newServer(ctx context.Context, logger *log.Logger) *server {
 	return &server{ctx: ctx, logger: logger, documents: make(map[string]document),
-		pending: make(map[string]time.Time), published: make(map[string]map[string]bool),
+		pending: make(map[string]time.Time), published: make(map[string]map[string]bool), dirty: make(map[string]bool),
 		wake: make(chan struct{}, 1), exit: make(chan int, 1), done: make(chan struct{}), load: analyze}
 }
 
@@ -116,6 +117,7 @@ func (s *server) DidOpen(_ context.Context, p *protocol.DidOpenTextDocumentParam
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.documents[path] = document{p.TextDocument.URI, p.TextDocument.Text, p.TextDocument.Version}
+	delete(s.dirty, path)
 	s.invalidate(filepath.Dir(path))
 	s.schedule(filepath.Dir(path))
 	return nil
@@ -142,6 +144,7 @@ func (s *server) DidChange(_ context.Context, p *protocol.DidChangeTextDocumentP
 	doc.version = p.TextDocument.Version
 	s.documents[path] = doc
 	dir := filepath.Dir(path)
+	s.dirty[path] = true
 	s.invalidate(dir)
 	// Ввод отменяет и ожидающие проверки: новую запускает только открытие или сохранение.
 	delete(s.pending, dir)
@@ -160,6 +163,7 @@ func (s *server) DidSave(_ context.Context, p *protocol.DidSaveTextDocumentParam
 		doc.text = *p.Text
 		s.documents[path] = doc
 	}
+	delete(s.dirty, path)
 	s.invalidate(filepath.Dir(path))
 	s.schedule(filepath.Dir(path))
 	return nil
@@ -173,10 +177,14 @@ func (s *server) DidClose(_ context.Context, p *protocol.DidCloseTextDocumentPar
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dir := filepath.Dir(path)
+	delete(s.dirty, path)
 	s.invalidate(dir)
 	s.clear(dir)
 	delete(s.documents, path)
 	delete(s.pending, dir)
+	if s.dirtyDir(dir) {
+		return nil // соседний документ правится: ждём его сохранения
+	}
 	for filename := range s.documents {
 		if filepath.Dir(filename) == dir {
 			s.schedule(dir)
@@ -239,6 +247,43 @@ func (s *server) clear(dir string) {
 	delete(s.published, dir)
 }
 
+// dirtyDir — есть ли в каталоге документы с несохранёнными правками.
+func (s *server) dirtyDir(dir string) bool {
+	for path := range s.dirty {
+		if filepath.Dir(path) == dir {
+			return true
+		}
+	}
+	return false
+}
+
+// apply заменяет опубликованные диагностики каталога dir результатом проверки.
+func (s *server) apply(dir string, result analysisResult) {
+	paths := make(map[string]bool)
+	for path := range s.published[dir] {
+		paths[path] = true
+	}
+	for path := range result.diagnostics {
+		if filepath.Dir(path) == dir {
+			paths[path] = true
+		}
+	}
+	for path := range s.documents {
+		if filepath.Dir(path) == dir {
+			paths[path] = true
+		}
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	for _, path := range ordered {
+		s.publish(path, result.diagnostics[path])
+	}
+	s.published[dir] = paths
+}
+
 func (s *server) work() {
 	defer close(s.done)
 	for {
@@ -266,27 +311,16 @@ func (s *server) work() {
 			result := s.load(ctx, dir, overlay)
 			s.mu.Lock()
 			if ctx.Err() == nil && generation == s.generation && !s.shutdown {
-				paths := make(map[string]bool)
-				for path := range s.published[dir] {
-					paths[path] = true
+				dirs := result.dirs
+				if len(dirs) == 0 {
+					dirs = []string{dir}
 				}
-				for path := range result.diagnostics {
-					paths[path] = true
-				}
-				for path := range s.documents {
-					if filepath.Dir(path) == dir {
-						paths[path] = true
+				for _, d := range dirs {
+					// Каталог, который правится, ждёт своего сохранения.
+					if d == dir || !s.dirtyDir(d) {
+						s.apply(d, result)
 					}
 				}
-				ordered := make([]string, 0, len(paths))
-				for path := range paths {
-					ordered = append(ordered, path)
-				}
-				sort.Strings(ordered)
-				for _, path := range ordered {
-					s.publish(path, result.diagnostics[path])
-				}
-				s.published[dir] = paths
 				if len(result.messages) != 0 {
 					s.log(strings.Join(result.messages, "\n"))
 				}

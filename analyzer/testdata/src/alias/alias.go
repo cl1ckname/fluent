@@ -1,4 +1,4 @@
-package alias
+package alias // want package:"structs \\[Account Amount Wallet\\]"
 
 // Слой прав (ALIASING_DESIGN.md, §11): блоки, права кадра, потери прав.
 // Вспомогательные функции use, useStatus, check и Touch удерживают указатель

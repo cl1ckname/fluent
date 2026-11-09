@@ -103,3 +103,97 @@ func TestWorkerDiscardsStaleResults(t *testing.T) {
 		t.Fatalf("wrong version: %+v", p.Version)
 	}
 }
+
+// Проверка каталога публикует диагностики и его импортёров, кроме каталогов
+// с несохранёнными правками.
+func TestWorkerPublishesDependents(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := newServer(ctx, log.New(io.Discard, "", 0))
+	c := newRecordingClient()
+	s.client = c
+	root := t.TempDir()
+	lib, use, edited := filepath.Join(root, "lib", "lib.go"), filepath.Join(root, "use", "use.go"), filepath.Join(root, "edited", "edited.go")
+	s.load = func(ctx context.Context, dir string, overlay map[string][]byte) analysisResult {
+		return analysisResult{
+			diagnostics: map[string][]protocol.Diagnostic{use: {{Message: protocol.String("use")}}, edited: {{Message: protocol.String("edited")}}},
+			dirs:        []string{filepath.Dir(edited), filepath.Dir(lib), filepath.Dir(use)},
+		}
+	}
+	go s.work()
+	t.Cleanup(func() { cancel(); <-s.done })
+	open := func(path string) {
+		if err := s.DidOpen(ctx, &protocol.DidOpenTextDocumentParams{TextDocument: protocol.TextDocumentItem{URI: uri.File(path), Version: 1, Text: "x"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	open(edited)
+	waitDiagnostic(t, c, edited, 1)
+	if err := s.DidChange(ctx, &protocol.DidChangeTextDocumentParams{
+		TextDocument:   protocol.VersionedTextDocumentIdentifier{TextDocumentIdentifier: protocol.TextDocumentIdentifier{URI: uri.File(edited)}, Version: 2},
+		ContentChanges: []protocol.TextDocumentContentChangeEvent{&protocol.TextDocumentContentChangeWholeDocument{Text: "y"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitDiagnostic(t, c, edited, 0) // ввод очищает диагностики каталога
+	open(lib)
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+	for got := map[string]bool{}; !got[lib] || !got[use]; {
+		select {
+		case p := <-c.diagnostics:
+			if p.URI.FsPath() == edited {
+				t.Fatalf("published into a directory with unsaved edits: %+v", p)
+			}
+			got[p.URI.FsPath()] = true
+		case <-timer.C:
+			t.Fatal("timed out waiting for lib and use")
+		}
+	}
+}
+
+// Закрытие соседнего файла не снимает защиту с несохранённого документа.
+func TestWorkerKeepsDirtyDocument(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := newServer(ctx, log.New(io.Discard, "", 0))
+	c := newRecordingClient()
+	s.client = c
+	dir := t.TempDir()
+	a, b := filepath.Join(dir, "a.go"), filepath.Join(dir, "b.go")
+	loads := make(chan struct{}, 10)
+	s.load = func(ctx context.Context, d string, overlay map[string][]byte) analysisResult {
+		loads <- struct{}{}
+		return analysisResult{diagnostics: map[string][]protocol.Diagnostic{a: {{Message: protocol.String("a")}}}}
+	}
+	go s.work()
+	t.Cleanup(func() { cancel(); <-s.done })
+	for _, path := range []string{a, b} {
+		if err := s.DidOpen(ctx, &protocol.DidOpenTextDocumentParams{TextDocument: protocol.TextDocumentItem{URI: uri.File(path), Version: 1, Text: "x"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitDiagnostic(t, c, a, 1)
+	if err := s.DidChange(ctx, &protocol.DidChangeTextDocumentParams{
+		TextDocument:   protocol.VersionedTextDocumentIdentifier{TextDocumentIdentifier: protocol.TextDocumentIdentifier{URI: uri.File(a)}, Version: 2},
+		ContentChanges: []protocol.TextDocumentContentChangeEvent{&protocol.TextDocumentContentChangeWholeDocument{Text: "y"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitDiagnostic(t, c, a, 0)
+	for len(loads) > 0 {
+		<-loads
+	}
+	if err := s.DidClose(ctx, &protocol.DidCloseTextDocumentParams{TextDocument: protocol.TextDocumentIdentifier{URI: uri.File(b)}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-loads:
+		t.Fatal("closing b.go triggered analysis of a directory with unsaved a.go")
+	case <-time.After(3 * debounce):
+	}
+	s.mu.Lock()
+	dirty := s.dirtyDir(dir)
+	s.mu.Unlock()
+	if !dirty {
+		t.Fatal("a.go lost its unsaved state")
+	}
+}

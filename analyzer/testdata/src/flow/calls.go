@@ -1,4 +1,4 @@
-package flow
+package flow // want package:"structs \\[amount rate wallet\\]"
 
 // Символические индексы: равенство доказуемо, только если значения связаны.
 func symbolic(x, y Currency) {
@@ -90,4 +90,12 @@ func unknownAmount() amount { return newAmount("rub", 1) }
 func noContract() {
 	a := newAmount("rub", 1)
 	_ = a.sum(unknownAmount()) // want `cannot prove a<c> == unknownAmount\(\)<c>`
+}
+
+type pairFunc func() (int, error)
+
+// Вызов значения именованного функционального типа с несколькими результатами.
+func namedFuncType(f pairFunc) {
+	n, err := f()
+	_, _ = n, err
 }

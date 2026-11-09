@@ -29,7 +29,7 @@ func resolveSource(t *testing.T, src string) (*Info, []string) {
 		t.Fatal(err)
 	}
 	var errs []string
-	out := Resolve([]*ast.File{f}, pkg, info, func(pos token.Pos, msg string) {
+	out := Resolve([]*ast.File{f}, pkg, InfoObjects(info), nil, func(pos token.Pos, msg string) {
 		errs = append(errs, msg)
 	})
 	return out, errs

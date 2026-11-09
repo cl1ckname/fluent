@@ -1,4 +1,4 @@
-package specerrors
+package specerrors // want package:"structs \\[amount holder pair\\].*spec errors"
 
 type Currency string
 
