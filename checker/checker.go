@@ -30,6 +30,12 @@ type Package struct {
 	Info  *types.Info
 
 	Imports *Exports // спецификации и сводки зависимостей; nil — нет
+
+	// GoErrors — ошибки Go в пакете или его зависимостях (разбора, типов,
+	// импорта); позиция может быть token.NoPos. Непустой список включает
+	// проверку по частям: функции и инициализаторы, которых касаются
+	// ошибки, пропускаются (broken.go).
+	GoErrors []Diagnostic
 }
 
 // Exports — то, что пакет даёт импортёрам: спецификации и сводки функций,
@@ -92,7 +98,11 @@ func Check(pkg *Package, report func(Diagnostic)) *Exports {
 	}
 	exp := &Exports{unproven: maps.Clone(c.unproven)}
 	specErrors := false
+	muted := c.mutedSpecs()
 	c.specs = bound.Resolve(pkg.Files, pkg.Types, bound.InfoObjects(pkg.Info), imported, func(pos token.Pos, msg string) {
+		if inSpans(muted, pos) {
+			return // следствие ошибки Go
+		}
 		specErrors = true
 		report(Diagnostic{Pos: pos, Message: msg})
 	})
@@ -104,7 +114,15 @@ func Check(pkg *Package, report func(Diagnostic)) *Exports {
 			if !ok || fd.Body == nil {
 				continue
 			}
-			if obj, _ := c.info.Defs[fd.Name].(*types.Func); obj != nil {
+			obj, _ := c.info.Defs[fd.Name].(*types.Func)
+			switch {
+			case obj == nil:
+			case c.broken(fd):
+				// Контракт без проверенного тела импортёры получают с пометкой.
+				if c.specs.Funcs[obj] != nil {
+					exp.unproven[obj] = c.goErrorNote(fd.Pos())
+				}
+			default:
 				funcs = append(funcs, funcDecl{obj, fd})
 			}
 		}
@@ -125,6 +143,9 @@ func Check(pkg *Package, report func(Diagnostic)) *Exports {
 
 	exp.Specs = c.specs
 	for _, d := range exportProblems(c.specs, pkg.Types) {
+		if inSpans(muted, d.Pos) {
+			continue
+		}
 		exp.SpecErrors = true
 		report(d)
 	}
@@ -149,7 +170,7 @@ func (c *checker) checkVarInits() {
 			}
 			for _, sp := range gd.Specs {
 				vs := sp.(*ast.ValueSpec)
-				if len(vs.Values) == 0 {
+				if len(vs.Values) == 0 || c.broken(vs) {
 					continue
 				}
 				lhs := make([]ast.Expr, len(vs.Names))

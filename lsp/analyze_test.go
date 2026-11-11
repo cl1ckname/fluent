@@ -88,11 +88,20 @@ func TestAnalyzeOverlayAndGoErrors(t *testing.T) {
 	if len(result.messages) != 0 || len(result.diagnostics) != 0 {
 		t.Fatalf("overlay should fix call: %+v", result)
 	}
-	for _, broken := range []string{"package money\nfunc broken( {", definitions + "\nvar broken int = \"string\"\n"} {
-		overlay[defs] = []byte(broken)
+	delete(overlay, call)
+	// Ошибки Go отключают только то, чего касаются: здесь — все определения
+	// (call.go пользуется неизвестным amount) или только переменную.
+	for _, c := range []struct {
+		defs string
+		want int
+	}{
+		{"package money\nfunc broken( {", 0},
+		{definitions + "\nvar broken int = \"string\"\n", 1},
+	} {
+		overlay[defs] = []byte(c.defs)
 		result = analyze(context.Background(), dir, overlay)
-		if len(result.messages) == 0 || len(result.diagnostics) != 0 {
-			t.Fatalf("Go errors should skip checking: %+v", result)
+		if len(result.messages) == 0 || len(result.diagnostics[call]) != c.want {
+			t.Fatalf("Go errors in %q: %+v", c.defs, result)
 		}
 	}
 	delete(overlay, defs)
@@ -100,6 +109,134 @@ func TestAnalyzeOverlayAndGoErrors(t *testing.T) {
 	result = analyze(context.Background(), dir, overlay)
 	if len(result.messages) != 0 || len(result.diagnostics[call]) != 1 {
 		t.Fatalf("did not recover: %+v", result)
+	}
+}
+
+// Пакет с ошибками Go проверяется по частям: сломанное объявление и всё,
+// что пользуется его невалидными типами, пропускается, остальное
+// проверяется. Факты такого пакета не кэшируются.
+func TestAnalyzePartial(t *testing.T) {
+	dir := testModule(t)
+	writeFile(t, dir, "defs.go", definitions)
+	path := writeFile(t, dir, "partial.go", `package money
+
+type order struct {
+	acc  *amount
+	meta metdata // неизвестный тип: поле невалидно
+}
+
+var limit = compute() // неизвестная функция
+
+// @ requires a<c> == "usd";
+func usd(a amount) {}
+
+func missingReturn() (amount, error) {
+}
+
+func usesMeta(o *order) { _ = o.meta; usd(amount{currency: "rub"}) }
+
+func usesLimit() { _ = limit; usd(amount{currency: "rub"}) }
+
+func healthy(o *order) {
+	usd(*o.acc)
+	usd(amount{currency: "rub"})
+	a, _ := missingReturn()
+	usd(a)
+}
+
+var bad = func() int { usd(amount{currency: "rub"}); return 0 }()
+`)
+	a := &analyzer{cache: newFactCache("")}
+	result := a.analyze(context.Background(), dir, nil)
+	if len(result.messages) == 0 {
+		t.Fatalf("no message about Go errors: %+v", result)
+	}
+	var lines []uint32
+	for _, d := range result.diagnostics[path] {
+		lines = append(lines, d.Range.Start.Line+1)
+	}
+	// healthy: *o.acc неизвестен (21), "rub" (22), результат missingReturn
+	// неизвестен (24); инициализатор bad (27).
+	if want := []uint32{21, 22, 24, 27}; !slices.Equal(lines, want) {
+		t.Fatalf("lines: got %v, want %v: %+v", lines, want, result.diagnostics[path])
+	}
+	if len(a.cache.mem) != 0 {
+		t.Fatalf("facts of a package with Go errors are cached: %d", len(a.cache.mem))
+	}
+}
+
+// Спецификации, которые ссылаются на сломанные ошибками Go типы, не дают
+// каскада сообщений; остальные спецификации проверяются.
+func TestAnalyzePartialSpecs(t *testing.T) {
+	dir := testModule(t)
+	path := writeFile(t, dir, "a.go", `package money
+
+// @ bound <c Curr>;
+type amount struct {
+	// @ equals c;
+	currency Curr
+}
+
+// @ bound <c string>;
+type wallet struct {
+	// @ equals c;
+	currency string
+	main     amount
+}
+
+// @ requires a<c> == b<c>;
+func sum(a, b amount) {}
+
+// @ requires x<c> == "usd";
+func bad(x Unknown) {}
+
+// @ bound <c string>;
+type ok struct {
+	// @ equals c;
+	currency string
+}
+
+// @ requires y<c> == "usd";
+func typo(o ok) {}
+
+// @ requires o<c> == "usd";
+func usd(o ok) {}
+
+func f() { sum(amount{}, amount{}); usd(ok{currency: "rub"}) }
+`)
+	result := (&analyzer{cache: newFactCache("")}).analyze(context.Background(), dir, nil)
+	var got []string
+	for _, d := range result.diagnostics[path] {
+		got = append(got, fmt.Sprintf("%d: %s", d.Range.Start.Line+1, d.Message))
+	}
+	if len(got) != 2 || !strings.HasPrefix(got[0], "28: ") || !strings.HasPrefix(got[1], "34: cannot prove") {
+		t.Fatalf("diagnostics: %q", got)
+	}
+}
+
+// Импортёр получает спецификации пакета с ошибками Go из той же проверки;
+// контракт сломанной функции помечен как непроверенный.
+func TestAnalyzePartialImporter(t *testing.T) {
+	root := testModule(t)
+	lib := mkdir(t, root, "lib")
+	writeFile(t, lib, "lib.go", libSource+`
+// @ returns Amount<c>;
+func Broken(c string) Amount {
+	return undefined
+}
+`)
+	use := writeFile(t, mkdir(t, root, "use"), "use.go", `package use
+import "example.com/money/lib"
+func f() { lib.Sum(lib.New("usd"), lib.New("rub")) }
+func g() { _ = lib.Broken("usd") }
+`)
+	result := analyze(context.Background(), lib, nil)
+	var got []string
+	for _, d := range result.diagnostics[use] {
+		got = append(got, string(d.Message.(protocol.String)))
+	}
+	if len(got) != 2 || !strings.Contains(got[0], "cannot prove") || !strings.Contains(got[1], "lib.go:13: the function has Go errors and is not checked") {
+		t.Fatalf("use: %q (%+v)", got, result)
 	}
 }
 

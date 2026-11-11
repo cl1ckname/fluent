@@ -179,11 +179,11 @@ func TestDiagnosticsOverProtocol(t *testing.T) {
 	save(defs)
 	select {
 	case message := <-s.client.messages:
-		if !strings.Contains(message, "skipping") {
+		if !strings.Contains(message, "has Go errors") {
 			t.Fatalf("message: %s", message)
 		}
 	case <-time.After(30 * time.Second):
-		t.Fatal("missing skip message")
+		t.Fatal("missing Go errors message")
 	}
 	change(defs, definitions, 3)
 	save(defs)

@@ -395,7 +395,10 @@ func (a *analyzer) check(ctx context.Context, dir string, overlay map[string][]b
 			return
 		}
 		report := covered[pkg.ID]
-		if pkg.IllTyped || len(pkg.Errors) != 0 || pkg.Types == nil || pkg.TypesInfo == nil {
+		// Пакет с ошибками Go проверяется по частям, только если его
+		// диагностики нужны: факты из него не берутся (он в процессе правки).
+		partial := pkg.IllTyped || len(pkg.Errors) != 0
+		if pkg.Types == nil || pkg.TypesInfo == nil || partial && !report {
 			if report {
 				reason := "package or dependency contains Go errors"
 				if len(pkg.Errors) != 0 {
@@ -404,6 +407,11 @@ func (a *analyzer) check(ctx context.Context, dir string, overlay map[string][]b
 				result.messages = append(result.messages, fmt.Sprintf("fluent: skipping %s: %s", pkg.ID, reason))
 			}
 			return
+		}
+		var goErrors []checker.Diagnostic
+		if partial {
+			goErrors = packageErrors(pkg)
+			result.messages = append(result.messages, fmt.Sprintf("fluent: %s has Go errors; declarations they affect are not checked", pkg.ID))
 		}
 		result.checked = append(result.checked, pkg.ID)
 		add := func(d checker.Diagnostic) {
@@ -430,14 +438,19 @@ func (a *analyzer) check(ctx context.Context, dir string, overlay map[string][]b
 		for _, d := range checker.SpecErrorImports(pkg.Syntax, importBad) {
 			add(d)
 		}
-		exp := checker.Check(&checker.Package{
+		exp, err := safeCheck(&checker.Package{
 			Fset: pkg.Fset, Files: pkg.Syntax, Types: pkg.Types, Info: pkg.TypesInfo,
-			Imports: checker.MergeExports(imports...),
+			Imports: checker.MergeExports(imports...), GoErrors: goErrors,
 		}, add)
+		if err != nil {
+			result.messages = append(result.messages, fmt.Sprintf("fluent: checking %s: %v", pkg.ID, err))
+			return
+		}
 		exports[pkg] = exp
 		// Импортёрам нужны факты только основного варианта пакета, не
-		// тестового; ключ есть у пакетов, посчитанных волной.
-		if st := states[pkg.ID]; st != nil && st.ready && pkg.ID == pkg.PkgPath {
+		// тестового; ключ есть у пакетов, посчитанных волной. Факты пакета
+		// с ошибками Go не кэшируются.
+		if st := states[pkg.ID]; st != nil && st.ready && !partial && pkg.ID == pkg.PkgPath {
 			var data []byte
 			structs := false
 			if exp != nil {
@@ -455,6 +468,70 @@ func (a *analyzer) check(ctx context.Context, dir string, overlay map[string][]b
 		visit(pkg)
 	}
 	return progress, false, nil
+}
+
+// safeCheck — checker.Check, где паника становится ошибкой: сервер не
+// должен падать из-за непредусмотренного случая (крайняя мера, не способ
+// обработки ошибок Go).
+func safeCheck(pkg *checker.Package, report func(checker.Diagnostic)) (exp *checker.Exports, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			exp, err = nil, fmt.Errorf("internal error: %v", r)
+		}
+	}()
+	return checker.Check(pkg, report), nil
+}
+
+// packageErrors — ошибки Go пакета с позициями в его FileSet (у ошибок без
+// позиции, например в зависимостях, — token.NoPos).
+func packageErrors(pkg *packages.Package) []checker.Diagnostic {
+	out := []checker.Diagnostic{{Pos: token.NoPos, Message: "package or dependency contains Go errors"}}
+	for _, e := range pkg.TypeErrors {
+		out = append(out, checker.Diagnostic{Pos: e.Pos, Message: e.Msg})
+	}
+	files := map[string]*token.File{}
+	for _, f := range pkg.Syntax {
+		if tf := pkg.Fset.File(f.Pos()); tf != nil {
+			files[filepath.Clean(tf.Name())] = tf
+		}
+	}
+	for _, e := range pkg.Errors {
+		if e.Kind == packages.TypeError {
+			continue // уже есть в TypeErrors
+		}
+		out = append(out, checker.Diagnostic{Pos: errorPos(files, e.Pos), Message: e.Msg})
+	}
+	return out
+}
+
+// errorPos переводит позицию «файл:строка:столбец» в token.Pos.
+func errorPos(files map[string]*token.File, pos string) token.Pos {
+	var line, col int
+	i := strings.LastIndexByte(pos, ':')
+	if i < 0 {
+		return token.NoPos
+	}
+	if _, err := fmt.Sscanf(pos[i+1:], "%d", &col); err != nil {
+		return token.NoPos
+	}
+	pos = pos[:i]
+	if j := strings.LastIndexByte(pos, ':'); j >= 0 {
+		if _, err := fmt.Sscanf(pos[j+1:], "%d", &line); err != nil {
+			return token.NoPos
+		}
+		pos = pos[:j]
+	} else {
+		line, col = col, 1
+	}
+	tf := files[filepath.Clean(pos)]
+	if tf == nil || line < 1 || line > tf.LineCount() {
+		return token.NoPos
+	}
+	p := tf.LineStart(line) + token.Pos(max(col, 1)-1)
+	if int(p)-tf.Base() > tf.Size() {
+		return token.NoPos
+	}
+	return p
 }
 
 type goEnvironment struct {

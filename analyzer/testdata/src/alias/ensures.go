@@ -3,6 +3,7 @@ package alias
 import (
 	"errors"
 	"fmt"
+	"math/big"
 )
 
 // Постусловия ensures (SPEC.md, §6, §7).
@@ -168,4 +169,9 @@ func mustBeActive(a Account) {
 func valueEnsures(a Account) {
 	mustBeActive(a)
 	requireInactiveV(a) // want `cannot prove a<s> == StatusInactive \("active" vs "inactive"\)`
+}
+
+// @ ensures err != nil ==> res == nil;
+func todelete() (res *big.Int, err error) {
+	return
 }
