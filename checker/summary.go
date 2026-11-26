@@ -35,20 +35,22 @@ type paramSum struct {
 	ownTo   int
 	ownPath []*types.Var
 	wrote   bool // функция сама писала в объект (для перенесённых)
+	pinned  bool // индекс закреплён контейнером
 }
 
 type resultSum struct {
-	fresh bool         // указатель на новый объект с полным правом (Fresh)
-	alias int          // >= 0 — указатель в память параметра с этим номером
-	slot  []*types.Var // не nil — во владеющий слот параметра по этому пути
-	path  []*types.Var // путь внутри памяти (параметра или объекта в слоте)
+	fresh  bool         // указатель на новый объект с полным правом (Fresh)
+	alias  int          // >= 0 — указатель в память параметра с этим номером
+	slot   []*types.Var // не nil — во владеющий слот параметра по этому пути
+	path   []*types.Var // путь внутри памяти (параметра или объекта в слоте)
+	pinned bool
 }
 
 func (s *summary) equal(o *summary) bool {
 	return slices.EqualFunc(s.params, o.params, func(a, b paramSum) bool {
-		return a.access == b.access && a.kept == b.kept && a.ownTo == b.ownTo && slices.Equal(a.ownPath, b.ownPath) && a.wrote == b.wrote
+		return a.access == b.access && a.kept == b.kept && a.ownTo == b.ownTo && slices.Equal(a.ownPath, b.ownPath) && a.wrote == b.wrote && a.pinned == b.pinned
 	}) && slices.EqualFunc(s.results, o.results, func(a, b resultSum) bool {
-		return a.fresh == b.fresh && a.alias == b.alias && slices.Equal(a.slot, b.slot) && slices.Equal(a.path, b.path)
+		return a.fresh == b.fresh && a.alias == b.alias && slices.Equal(a.slot, b.slot) && slices.Equal(a.path, b.path) && a.pinned == b.pinned
 	})
 }
 
@@ -238,6 +240,9 @@ func (fc *funcChecker) exit(vals []term) {
 	}
 	for i, b := range fc.paramBlocks {
 		ps := &fc.sum.params[i]
+		if b >= 0 {
+			ps.pinned = ps.pinned || fc.indicesPinned(b)
+		}
 		if b < 0 || ps.kept != "" {
 			continue
 		}
@@ -272,7 +277,7 @@ func (fc *funcChecker) exit(vals []term) {
 		case r.alias == -2: // nil: подходит к любому
 		case fc.sum.results[i].alias == -2:
 			fc.sum.results[i] = r
-		case r.fresh != fc.sum.results[i].fresh || r.alias != fc.sum.results[i].alias ||
+		case r.fresh != fc.sum.results[i].fresh || r.alias != fc.sum.results[i].alias || r.pinned != fc.sum.results[i].pinned ||
 			!slices.Equal(r.slot, fc.sum.results[i].slot) || !slices.Equal(r.path, fc.sum.results[i].path):
 			fc.sum.results[i] = resultSum{alias: -1}
 		}
@@ -310,7 +315,7 @@ func (fc *funcChecker) classify(t term, earlier []term) resultSum {
 		}
 	}
 	if _, isVar := fc.blockVar[b]; !isVar && len(info.path) == 0 && fc.fl.perms[b].writable() && !fc.isParamPart(b) {
-		return resultSum{fresh: true, alias: -1}
+		return resultSum{fresh: true, alias: -1, pinned: fc.indicesPinned(b)}
 	}
 	return resultSum{alias: -1}
 }
@@ -419,12 +424,19 @@ func (fc *funcChecker) applyCall(call *ast.CallExpr, fn *types.Func, params []*t
 			fc.errorf(call.Lparen, "cannot pass %s to %s: no access: %s", d.args[0], name, p.why)
 		case d.write && !p.writable():
 			fc.errorf(call.Lparen, "cannot pass %s to %s: %s may write to it, but access is read-only: %s", d.args[0], name, name, p.why)
+		case d.write && fc.indicesPinned(b):
+			fc.errorf(call.Lparen, "cannot pass %s to %s: its index is held by a slice and %s may change it", d.args[0], name, name)
 		}
 	}
 	// После вызова: удержанное теряется, записанное — новая версия.
 	for i, ps := range s.params {
 		if i >= len(infos) || len(infos[i].blocks) == 0 {
 			continue
+		}
+		if ps.pinned {
+			for _, b := range infos[i].blocks {
+				fc.fl.pinned[fc.root(b)] = true
+			}
 		}
 		switch {
 		case ps.kept != "":
@@ -449,6 +461,7 @@ func (fc *funcChecker) applyCall(call *ast.CallExpr, fn *types.Func, params []*t
 		case r.fresh:
 			fresh[i] = fc.newBlock(fmt.Sprintf("(%s() at line %d)", name, fc.line(call.Lparen)), rt, fc.fresh(name+"()"))
 			fc.fl.ptrs[results[i]] = ptrInfo{blocks: []blockID{fresh[i]}, dependent: true}
+			fc.fl.pinned[fresh[i]] = r.pinned
 		case r.alias >= 0 && r.alias < len(infos) && len(infos[r.alias].blocks) > 0:
 			info := infos[r.alias]
 			switch {

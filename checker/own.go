@@ -86,6 +86,7 @@ func (fc *funcChecker) childAt(b blockID, path []*types.Var, elem types.Type) bl
 	fc.blockType[c] = elem
 	fc.fl.content[c] = fc.fresh(name)
 	fc.fl.owner[c] = ownerRef{parent: b, path: slices.Clone(path)}
+	fc.fl.pinned[c] = fc.indicesPinned(b)
 	fc.fl.children[key] = c
 	return c
 }
@@ -120,13 +121,20 @@ func (fc *funcChecker) detachChildren(f *flow, b blockID) {
 // (OWNSTORE). Право на запись в регион b проверено вызывающим.
 func (fc *funcChecker) ownStore(pos token.Pos, b blockID, path []*types.Var, t term, what, slot string) {
 	key := slotKey{b, pathKey(path)}
-	if old, ok := fc.fl.children[key]; ok {
-		delete(fc.fl.children, key)
-		delete(fc.fl.owner, old)
-		fc.fl.perms[old] = perm{why: fmt.Sprintf("replaced in %s at line %d", slot, fc.line(pos))}
+	// Точная замена слота освобождает прежний подрегион, сохраняя его
+	// содержимое и алиасы. В отличие от detachChildren, здесь известно,
+	// какой блок удалён, а полное право на исходный регион уже проверено.
+	release := func() {
+		if old, ok := fc.fl.children[key]; ok {
+			fc.fl.pinned[old] = fc.indicesPinned(old)
+			delete(fc.fl.children, key)
+			delete(fc.fl.owner, old)
+			fc.fl.perms[old] = perm{kind: permSource}
+		}
+		fc.writes = append(fc.writes, b)
 	}
-	fc.writes = append(fc.writes, b)
 	if fc.fl.st.AreEqual(t, fc.nilTerm()) {
+		release()
 		return
 	}
 	info := fc.pointsTo(t)
@@ -142,6 +150,9 @@ func (fc *funcChecker) ownStore(pos token.Pos, b blockID, path []*types.Var, t t
 		return
 	}
 	q := info.blocks[0]
+	if old, ok := fc.fl.children[key]; ok && old == q {
+		return // Самоприсваивание не меняет ни состав региона, ни права.
+	}
 	if o, ok := fc.fl.owner[q]; ok {
 		cannot("%s already belongs to %s", what, fc.slotName(o))
 		return
@@ -151,6 +162,7 @@ func (fc *funcChecker) ownStore(pos token.Pos, b blockID, path []*types.Var, t t
 		return
 	}
 	p := fc.permOf(q)
+	pinned := fc.indicesPinned(q)
 	switch {
 	case !p.readable():
 		cannot("no access to %s: %s", what, p.why)
@@ -159,9 +171,15 @@ func (fc *funcChecker) ownStore(pos token.Pos, b blockID, path []*types.Var, t t
 		cannot("only read access to %s: %s", what, p.why)
 		return
 	}
+	// Не освобождаем старый объект до проверки нового: ошибочная запись
+	// не должна менять владение.
+	release()
 	delete(fc.fl.perms, q)
 	fc.losses = append(fc.losses, loss{q, fmt.Sprintf("moved into %s at line %d", slot, fc.line(pos))})
 	fc.fl.owner[q] = ownerRef{parent: b, path: slices.Clone(path)}
+	if pinned {
+		fc.fl.pinned[fc.root(b)] = true
+	}
 	fc.fl.children[key] = q
 }
 

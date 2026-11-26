@@ -46,6 +46,9 @@ func (fc *funcChecker) boolTerm(b bool) term { return fc.constant(constant.MakeB
 
 // expr вычисляет терм значения выражения (и проверяет вызовы внутри него).
 func (fc *funcChecker) expr(e ast.Expr) term {
+	previous := fc.at
+	fc.at = e.Pos()
+	defer func() { fc.at = previous }()
 	t := fc.eval(e)
 	fc.terms[ast.Unparen(e)] = t
 	return t
@@ -63,6 +66,9 @@ func (fc *funcChecker) eval(e ast.Expr) term {
 		case *types.Nil:
 			return fc.nilTerm()
 		case *types.Var:
+			if !fc.isLocal(obj) && fc.sliceType(obj.Type()) != nil {
+				fc.errorf(e.Pos(), "global indexed slices are not supported")
+			}
 			if !fc.suppressed(e) && fc.specs.Dependent(obj.Type()) {
 				fc.checkRoot(e.Pos(), e, fc.memRoot(e), false)
 			}
@@ -83,6 +89,48 @@ func (fc *funcChecker) eval(e ast.Expr) term {
 	case *ast.UnaryExpr:
 		switch e.Op {
 		case token.AND:
+			if fc.sliceType(fc.info.TypeOf(e.X)) != nil {
+				fc.expr(e.X)
+				fc.errorf(e.Pos(), "addresses of indexed slice headers are not supported")
+				return fc.fresh("unsupported address")
+			}
+			if sel, ok := ast.Unparen(e.X).(*ast.SelectorExpr); ok {
+				base := ast.Unparen(sel.X)
+				for {
+					next, ok := base.(*ast.SelectorExpr)
+					if !ok {
+						break
+					}
+					base = ast.Unparen(next.X)
+				}
+				if index, ok := base.(*ast.IndexExpr); ok && fc.sliceType(fc.info.TypeOf(index.X)) != nil && !isPointer(fc.info.TypeOf(index)) {
+					fc.expr(index.X)
+					fc.expr(index.Index)
+					fc.errorf(e.Pos(), "addresses inside slice elements are not supported")
+					return fc.fresh("unsupported address")
+				}
+			}
+			if index, ok := ast.Unparen(e.X).(*ast.IndexExpr); ok && fc.sliceType(fc.info.TypeOf(index.X)) != nil {
+				s := fc.expr(index.X)
+				fc.expr(index.Index)
+				shape := fc.sliceShape(s, fc.info.TypeOf(index.X))
+				if isPointer(fc.info.TypeOf(index)) {
+					fc.errorf(e.Pos(), "addresses of pointer slots in slices are not supported")
+					return fc.fresh("unsupported address")
+				}
+				for _, a := range shape.args {
+					if a == none {
+						fc.errorf(e.Pos(), "cannot take address of an existential slice element")
+						return fc.fresh("unsupported address")
+					}
+				}
+				v := fc.sliceElement(e.Pos(), s, fc.info.TypeOf(index.X))
+				p := fc.fresh("slice element address")
+				b := fc.newBlock("slice element", fc.info.TypeOf(index), v)
+				fc.fl.pinned[b] = true
+				fc.fl.ptrs[p] = ptrInfo{blocks: []blockID{b}, dependent: true}
+				return p
+			}
 			// &x: *p ≈ x. Индексы x стабильны, поэтому это верно и дальше.
 			fc.noAccess(e.X)
 			x := fc.expr(e.X)
@@ -106,18 +154,28 @@ func (fc *funcChecker) eval(e ast.Expr) term {
 		fc.expr(e.X)
 		fc.expr(e.Y)
 	case *ast.IndexExpr:
-		fc.expr(e.X)
+		s := fc.expr(e.X)
 		fc.expr(e.Index)
+		if fc.sliceType(fc.info.TypeOf(e.X)) != nil {
+			return fc.sliceElement(e.Pos(), s, fc.info.TypeOf(e.X))
+		}
 	case *ast.IndexListExpr:
 		fc.expr(e.X)
 	case *ast.SliceExpr:
-		for _, x := range []ast.Expr{e.X, e.Low, e.High, e.Max} {
+		s := fc.expr(e.X)
+		for _, x := range []ast.Expr{e.Low, e.High, e.Max} {
 			if x != nil {
 				fc.expr(x)
 			}
 		}
+		if fc.sliceType(fc.info.TypeOf(e.X)) != nil {
+			return s
+		}
 	case *ast.TypeAssertExpr:
 		fc.expr(e.X)
+		if e.Type != nil && fc.sliceType(fc.info.TypeOf(e.Type)) != nil {
+			fc.errorf(e.Pos(), "cannot recover indexed slice type from an interface")
+		}
 	case *ast.KeyValueExpr:
 		fc.expr(e.Value)
 	}
@@ -191,6 +249,10 @@ func (fc *funcChecker) fieldRead(base term, st types.Type, f *types.Var, stable 
 		ft = fc.fresh(f.Name())
 	}
 	if fa != nil && fa.Close != nil {
+		if fc.sliceType(f.Type()) != nil {
+			fc.setSliceClose(ft, f.Type(), fa.Close, nil, base)
+			return ft
+		}
 		target := fc.specs.Bounded(f.Type())
 		for i, arg := range fa.Close {
 			fc.fl.st.AssertEqual(fc.idx(ft, target.Params[i]), fc.specTerm(arg, nil, base))
@@ -241,6 +303,9 @@ func (fc *funcChecker) specTerm(e bound.Expr, vars map[*types.Var]term, self ter
 // call вычисляет вызов, проверяет requires и возвращает термы результатов
 // с фактами из returns.
 func (fc *funcChecker) call(call *ast.CallExpr) []term {
+	if result, ok := fc.sliceBuiltin(call); ok {
+		return result
+	}
 	fun := ast.Unparen(call.Fun)
 	tv := fc.info.Types[fun]
 	if tv.IsType() && len(call.Args) == 1 {
@@ -304,7 +369,27 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 		recvTerm, recvType = t, recv.Type()
 	}
 
-	argTerms := fc.values(args, tupleLen(sig))
+	var spec *bound.Func
+	if fn != nil {
+		spec = fc.specs.Funcs[fn.Origin()]
+	}
+	var argTerms []term
+	if sig != nil && !sig.Variadic() && len(args) == sig.Params().Len() {
+		for i, arg := range args {
+			v := sig.Params().At(i)
+			var t term
+			if spec != nil && spec.Closes[v] != nil {
+				t = fc.sliceExpr(arg, fc.closeArgs(spec.Closes[v], vars, none))
+			} else {
+				t = fc.expr(arg)
+			}
+			argTerms = append(argTerms, t)
+			vars[v] = t
+			names[v] = v.Name()
+		}
+	} else {
+		argTerms = fc.values(args, tupleLen(sig))
+	}
 	if sig != nil {
 		params := sig.Params()
 		for i, t := range argTerms {
@@ -320,18 +405,78 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 			}
 		}
 	}
-
-	var spec *bound.Func
-	if fn != nil {
-		spec = fc.specs.Funcs[fn.Origin()]
+	if sig != nil && sig.Variadic() && fc.sliceType(sig.Params().At(sig.Params().Len()-1).Type()) != nil {
+		v := sig.Params().At(sig.Params().Len() - 1)
+		names[v] = v.Name()
+		start := sig.Params().Len() - 1
+		var a []term
+		if spec != nil && spec.Closes[v] != nil {
+			a = fc.closeArgs(spec.Closes[v], vars, none)
+		}
+		if call.Ellipsis.IsValid() && len(argTerms) > start {
+			t := argTerms[start]
+			if a != nil {
+				fc.compatibleSlice(call.Pos(), fc.sliceShape(t, v.Type()).args, a, v.Name())
+			} else {
+				for _, arg := range fc.sliceShape(t, v.Type()).args {
+					if arg == none {
+						fc.errorf(call.Pos(), "cannot pass %s: slice indices are invariant", v.Name())
+						break
+					}
+				}
+			}
+			vars[v] = t
+		} else {
+			t := fc.fresh("variadic slice")
+			if a == nil {
+				a = fc.sliceShape(t, v.Type()).args
+				if len(argTerms) > start {
+					first := argTerms[start]
+					if isPointer(fc.sliceType(v.Type()).Elem()) {
+						first = fc.deref(first)
+					}
+					a = make([]term, len(a))
+					for i, p := range fc.specs.Bounded(v.Type()).Params {
+						a[i] = fc.idx(first, p)
+					}
+				}
+			}
+			for i := start; i < len(argTerms); i++ {
+				fc.storeSliceElement(call.Pos(), argTerms[i], fc.sliceType(v.Type()).Elem(), a)
+			}
+			fc.putSlice(t, v.Type(), a)
+			vars[v] = t
+		}
 	}
+
 	if spec != nil {
+		for v, args := range spec.Closes {
+			if t, ok := vars[v]; ok {
+				fc.checkSliceClose(call.Pos(), t, v.Type(), args, vars, none, names[v])
+			}
+		}
 		if why, ok := fc.unproven[fn.Origin()]; ok {
 			fc.errorf(call.Lparen, "contract of %s is not proven in its package: %s", fc.funcName(fn), why)
 		}
 		for _, eq := range spec.Requires {
 			l, r := fc.specTerm(eq.Left, vars, none), fc.specTerm(eq.Right, vars, none)
 			fc.prove(call.Lparen, l, r, render(eq.Left, names)+" == "+render(eq.Right, names))
+		}
+	}
+	if sig != nil && !fc.builtinCall(fun) {
+		for v, t := range vars {
+			if sig.Variadic() && v == sig.Params().At(sig.Params().Len()-1) {
+				continue
+			}
+			if fc.sliceType(v.Type()) == nil || (spec != nil && spec.Closes[v] != nil) {
+				continue
+			}
+			for _, a := range fc.sliceShape(t, v.Type()).args {
+				if a == none {
+					fc.errorf(call.Pos(), "cannot pass %s: slice indices are invariant; parameter needs close <?>", names[v])
+					break
+				}
+			}
 		}
 	}
 
@@ -361,6 +506,10 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 			if r.Args == nil {
 				continue
 			}
+			if fc.sliceType(r.Type) != nil {
+				fc.setSliceClose(results[i], r.Type, r.Args, vars, none)
+				continue
+			}
 			target := fc.specs.Bounded(r.Type)
 			for j, arg := range r.Args {
 				fc.fl.st.AssertEqual(fc.idx(results[i], target.Params[j]), fc.specTerm(arg, vars, none))
@@ -372,7 +521,7 @@ func (fc *funcChecker) call(call *ast.CallExpr) []term {
 	pParams, pTerms, pNames := fc.callParams(sig, recvTerm, args, argTerms)
 	if call == fc.async || !fc.applyCall(call, fn, pParams, pTerms, pNames, results) {
 		fc.escapeCall(call, fn, calleeName, recvTerm, recvType, args, argTerms)
-	} else if sig.Variadic() && len(args) == len(argTerms) {
+	} else if sig.Variadic() && len(args) == len(argTerms) && fc.sliceType(sig.Params().At(sig.Params().Len()-1).Type()) == nil {
 		// Вариативные аргументы попадают в срез: утекают.
 		why := fmt.Sprintf("passed to %s at line %d", calleeName, fc.line(call.Lparen))
 		for i := sig.Params().Len() - 1; i < len(args); i++ {
@@ -439,6 +588,9 @@ func render(e bound.Expr, names map[*types.Var]string) string {
 
 func (fc *funcChecker) compositeLit(e *ast.CompositeLit) term {
 	t := fc.info.TypeOf(e)
+	if fc.sliceType(t) != nil {
+		return fc.sliceLiteral(e)
+	}
 	st, ok := t.Underlying().(*types.Struct)
 	if !ok {
 		why := fmt.Sprintf("stored in a composite literal at line %d", fc.line(e.Pos()))
@@ -446,6 +598,9 @@ func (fc *funcChecker) compositeLit(e *ast.CompositeLit) term {
 			if kv, ok := el.(*ast.KeyValueExpr); ok {
 				fc.escape(fc.expr(kv.Key), fc.info.TypeOf(kv.Key), why, 2)
 				el = kv.Value
+			}
+			if fc.sliceType(fc.info.TypeOf(el)) != nil {
+				fc.errorf(el.Pos(), "indexed slices inside other containers are not supported")
 			}
 			fc.escape(fc.expr(el), fc.info.TypeOf(el), why, 2)
 		}
@@ -455,10 +610,10 @@ func (fc *funcChecker) compositeLit(e *ast.CompositeLit) term {
 	for i, el := range e.Elts {
 		if kv, ok := el.(*ast.KeyValueExpr); ok {
 			if f, ok := fc.info.Uses[kv.Key.(*ast.Ident)].(*types.Var); ok {
-				vals[f] = fc.expr(kv.Value)
+				vals[f] = fc.fieldExpr(kv.Value, t, f)
 			}
 		} else {
-			vals[st.Field(i)] = fc.expr(el)
+			vals[st.Field(i)] = fc.fieldExpr(el, t, st.Field(i))
 		}
 	}
 	return fc.build(t, vals, e.Pos())
@@ -499,6 +654,17 @@ func (fc *funcChecker) build(t types.Type, vals map[*types.Var]term, pos token.P
 			continue
 		}
 		target := fc.specs.Bounded(fa.Var.Type())
+		if fc.sliceType(fa.Var.Type()) != nil {
+			shape := fc.sliceShape(v, fa.Var.Type())
+			for i, arg := range fa.Close {
+				if sp, yes := arg.(*bound.SelfParam); yes && !defined[sp.Param] && shape.args[i] != none {
+					defined[sp.Param] = true
+					fc.fl.st.AssertEqual(fc.idx(r, sp.Param), shape.args[i])
+				}
+			}
+			fc.checkSliceClose(pos, v, fa.Var.Type(), fa.Close, nil, r, name+"."+fa.Var.Name())
+			continue
+		}
 		for i, arg := range fa.Close {
 			got := fc.idx(v, target.Params[i])
 			if sp, isSelf := arg.(*bound.SelfParam); isSelf && !defined[sp.Param] {
@@ -519,6 +685,11 @@ func (fc *funcChecker) build(t types.Type, vals map[*types.Var]term, pos token.P
 
 // zero — терм нулевого значения типа t.
 func (fc *funcChecker) zero(t types.Type, pos token.Pos) term {
+	if fc.sliceType(t) != nil {
+		r := fc.fresh("nil slice")
+		fc.sliceShape(r, t)
+		return r
+	}
 	switch u := t.Underlying().(type) {
 	case *types.Basic:
 		switch {

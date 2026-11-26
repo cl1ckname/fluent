@@ -184,7 +184,7 @@ func (fc *funcChecker) writeAt(pos token.Pos, b blockID, path []*types.Var, val 
 		parent = fc.fieldRead(parent, typ, f, true)
 		typ = f.Type()
 	}
-	nb, ok := fc.rebuild(pos, parent, typ, path[len(path)-1], val, true, true, what, what)
+	nb, ok := fc.rebuild(pos, parent, typ, path[len(path)-1], val, !fc.indicesPinned(b), true, what, what)
 	if ok {
 		fc.writeAt(pos, b, path[:len(path)-1], nb, what)
 	}
@@ -464,6 +464,12 @@ func (fc *funcChecker) escape(t term, typ types.Type, why string, depth int) {
 	}
 	switch u := typ.Underlying().(type) {
 	case *types.Pointer, *types.Interface:
+		for _, b := range fc.pointsTo(t).blocks {
+			if fc.indicesPinned(b) {
+				fc.errorf(fc.at, "cannot let pointer escape: its index is held by a slice (%s)", why)
+				break
+			}
+		}
 		fc.lose(fc.pointsTo(t).blocks, why)
 	case *types.Struct:
 		if depth == 0 {
@@ -506,6 +512,14 @@ func (fc *funcChecker) escapeCall(call *ast.CallExpr, fn *types.Func, name strin
 		}
 	}
 	why := fmt.Sprintf("passed to %s at line %d", name, fc.line(call.Lparen))
+	if fc.sliceType(fc.info.TypeOf(call)) != nil {
+		fc.errorf(call.Pos(), "cannot receive an indexed slice from an unknown call")
+	}
+	for _, arg := range args {
+		if fc.containsIndexedSlice(fc.info.TypeOf(arg), map[types.Type]bool{}) {
+			fc.errorf(arg.Pos(), "cannot pass an indexed slice to an unknown call")
+		}
+	}
 	if recv != none {
 		fc.escape(recv, recvType, why, 2)
 	}

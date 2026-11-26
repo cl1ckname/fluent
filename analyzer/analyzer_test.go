@@ -16,6 +16,10 @@ func TestAlias(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "alias")
 }
 
+func TestSlices(t *testing.T) {
+	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "slicetypes", "slicelib", "sliceclient")
+}
+
 // Межпакетность: спецификации и сводки зависимостей через факт пакета.
 func TestCrossPackage(t *testing.T) {
 	analysistest.Run(t, analysistest.TestData(), analyzer.Analyzer, "crossa", "crossmid", "crossplain", "crossbad", "crossb")

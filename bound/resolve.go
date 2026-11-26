@@ -54,6 +54,32 @@ func Resolve(files []*ast.File, pkg *types.Package, objs Objects, imports *Info,
 	for _, d := range r.types {
 		r.resolveFields(d)
 	}
+	annotated := map[*types.Var]bool{}
+	for _, st := range r.out.Structs {
+		for _, f := range st.Fields {
+			if f.Close != nil {
+				annotated[f.Var] = true
+			}
+		}
+	}
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			field, ok := n.(*ast.Field)
+			if !ok {
+				return true
+			}
+			for _, name := range field.Names {
+				v, ok := r.objs.Def(name).(*types.Var)
+				if !ok || !v.IsField() {
+					continue
+				}
+				if _, ok := v.Type().Underlying().(*types.Slice); ok && r.out.Bounded(v.Type()) != nil && !annotated[v] {
+					r.errorf(name.Pos(), "indexed slice field %s requires close", name.Name)
+				}
+			}
+			return true
+		})
+	}
 	for _, d := range r.funcs {
 		r.resolveFunc(d)
 	}
@@ -88,6 +114,7 @@ type funcDecl struct {
 	file    *ast.File
 	obj     *types.Func
 	clauses []spec.Clause
+	params  []fieldDecl
 }
 
 func (r *resolver) errorf(pos token.Pos, format string, args ...any) {
@@ -108,8 +135,22 @@ func (r *resolver) collect(file *ast.File) {
 		switch d := decl.(type) {
 		case *ast.FuncDecl:
 			obj, _ := r.objs.Def(d.Name).(*types.Func)
-			if cs := r.parse(d.Doc); len(cs) > 0 && obj != nil {
-				r.funcs = append(r.funcs, &funcDecl{file: file, obj: obj, clauses: cs})
+			fd := &funcDecl{file: file, obj: obj, clauses: r.parse(d.Doc)}
+			previous := d.Type.Params.Opening
+			for _, f := range d.Type.Params.List {
+				var cs []spec.Clause
+				for _, group := range file.Comments {
+					if previous < group.Pos() && group.End() < f.Pos() {
+						cs = append(cs, r.parse(group)...)
+					}
+				}
+				if len(cs) > 0 {
+					fd.params = append(fd.params, fieldDecl{field: f, clauses: cs})
+				}
+				previous = f.End()
+			}
+			if (len(fd.clauses) > 0 || len(fd.params) > 0) && obj != nil {
+				r.funcs = append(r.funcs, fd)
 			}
 		case *ast.GenDecl:
 			if d.Tok != token.TYPE {
@@ -307,6 +348,9 @@ func (r *resolver) resolveClose(d *typeDecl, s *Struct, v *types.Var, c *spec.Cl
 	if args == nil {
 		return nil
 	}
+	if !r.sliceWildcards(v.Type(), args, c.Pos()) {
+		return nil
+	}
 	return &Field{Var: v, Close: args}
 }
 
@@ -322,7 +366,29 @@ func (r *resolver) resolveFunc(d *funcDecl) {
 		sc.vars[v.Name()] = v
 	}
 
-	fn := &Func{Obj: d.obj}
+	fn := &Func{Obj: d.obj, Closes: map[*types.Var][]Expr{}}
+	for _, pd := range d.params {
+		for _, c := range pd.clauses {
+			cl, ok := c.(*spec.Close)
+			if !ok {
+				r.errorf(c.Pos(), "%s is not allowed on a parameter", keyword(c))
+				continue
+			}
+			for _, name := range pd.field.Names {
+				v, _ := r.objs.Def(name).(*types.Var)
+				if v == nil {
+					continue
+				}
+				if _, exists := fn.Closes[v]; exists {
+					r.errorf(c.Pos(), "duplicate close for %s", name.Name)
+					continue
+				}
+				if a := r.sliceClose(sc, v.Type(), cl); a != nil {
+					fn.Closes[v] = a
+				}
+			}
+		}
+	}
 	var returns *spec.Returns
 	for _, c := range d.clauses {
 		switch c := c.(type) {
@@ -347,7 +413,7 @@ func (r *resolver) resolveFunc(d *funcDecl) {
 			r.errorf(c.Pos(), "%s is not allowed on a function", keyword(c))
 		}
 	}
-	if len(fn.Requires) > 0 || fn.Returns != nil || len(fn.Ensures) > 0 {
+	if len(fn.Requires) > 0 || fn.Returns != nil || len(fn.Ensures) > 0 || len(fn.Closes) > 0 {
 		r.out.Funcs[d.obj] = fn
 	}
 }
@@ -482,6 +548,9 @@ func (r *resolver) returns(sc *scope, sig *types.Signature, c *spec.Returns) []R
 		if out[i].Args = r.args(sc, target, rt.Args, rt.Type.Name.At); out[i].Args == nil {
 			return nil
 		}
+		if !r.sliceWildcards(t, out[i].Args, rt.Type.Name.At) {
+			return nil
+		}
 	}
 	return out
 }
@@ -494,6 +563,10 @@ func (r *resolver) args(sc *scope, target *Struct, terms []spec.Term, pos token.
 	}
 	out := make([]Expr, len(terms))
 	for i, t := range terms {
+		if w, ok := t.(*spec.Wildcard); ok {
+			out[i] = &Wildcard{Typ: target.Params[i].Type, At: w.At}
+			continue
+		}
 		e := r.term(sc, t)
 		if e == nil {
 			return nil
@@ -633,7 +706,46 @@ func (r *resolver) typeOf(file *ast.File, tn spec.TypeName) types.Type {
 		r.errorf(tn.Name.At, "%s is not a type", name)
 		return nil
 	}
-	return tobj.Type()
+	t := tobj.Type()
+	switch tn.Prefix {
+	case "[]":
+		t = types.NewSlice(t)
+	case "[]*":
+		t = types.NewSlice(types.NewPointer(t))
+	}
+	return t
+}
+
+func (r *resolver) sliceWildcards(t types.Type, args []Expr, pos token.Pos) bool {
+	if _, ok := t.Underlying().(*types.Slice); ok {
+		return true
+	}
+	for _, a := range args {
+		if _, ok := a.(*Wildcard); ok {
+			r.errorf(pos, "existential indices are only supported in slices")
+			return false
+		}
+	}
+	return true
+}
+
+func (r *resolver) sliceClose(sc *scope, typ types.Type, c *spec.Close) []Expr {
+	if _, ok := typ.Underlying().(*types.Slice); !ok {
+		r.errorf(c.Pos(), "close on a variable or parameter requires a slice")
+		return nil
+	}
+	target := r.out.Bounded(typ)
+	if target == nil {
+		r.errorf(c.Pos(), "type %s has no bound parameters", typ)
+		return nil
+	}
+	return r.args(sc, target, c.Args, c.Pos())
+}
+
+// ResolveSliceClose разрешает локальную аннотацию в текущей области видимости.
+func ResolveSliceClose(file *ast.File, pkg *types.Package, objects *types.Info, info *Info, vars map[string]*types.Var, typ types.Type, c *spec.Close, report func(token.Pos, string)) []Expr {
+	r := &resolver{pkg: pkg, out: info, objs: InfoObjects(objects), report: report}
+	return r.sliceClose(&scope{file: file, vars: vars}, typ, c)
 }
 
 // lookup ищет имя на уровне пакета: объявления пакета, импорты файла, universe.

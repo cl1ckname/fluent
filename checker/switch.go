@@ -109,6 +109,9 @@ func (fc *funcChecker) clauses(s ast.Stmt) {
 			var pos, neg facts
 			switch {
 			case !valued:
+				if fc.info.Types[e].IsType() && fc.sliceType(fc.info.TypeOf(e)) != nil {
+					fc.errorf(e.Pos(), "cannot recover indexed slice type from an interface")
+				}
 				fc.expr(e)
 			case hasTag:
 				pos, neg = fc.eqFacts(tag, fc.expr(e))

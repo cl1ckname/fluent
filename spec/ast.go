@@ -75,8 +75,9 @@ type Equality struct {
 
 // TypeName — имя типа Go: `T` или `pkg.T`.
 type TypeName struct {
-	Pkg  *Ident
-	Name Ident
+	Prefix string // [], []* — контейнерные типы в returns
+	Pkg    *Ident
+	Name   Ident
 }
 
 type Ident struct {
@@ -109,6 +110,13 @@ type Lit struct {
 	Kind  token.Token
 	Value string
 }
+
+// Wildcard — экзистенциальный индекс в аргументах close/returns.
+type Wildcard struct{ At token.Pos }
+
+func (t *Wildcard) Pos() token.Pos { return t.At }
+func (t *Wildcard) String() string { return "?" }
+func (*Wildcard) term()            {}
 
 func (c *Bound) Pos() token.Pos    { return c.At }
 func (c *Equals) Pos() token.Pos   { return c.At }
@@ -187,9 +195,9 @@ func (e Equality) String() string { return e.Left.String() + " == " + e.Right.St
 
 func (t TypeName) String() string {
 	if t.Pkg != nil {
-		return t.Pkg.Name + "." + t.Name.Name
+		return t.Prefix + t.Pkg.Name + "." + t.Name.Name
 	}
-	return t.Name.Name
+	return t.Prefix + t.Name.Name
 }
 
 func (t *Path) String() string {

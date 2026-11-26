@@ -29,6 +29,8 @@ type flow struct {
 	// Регионы (own.go).
 	owner    map[blockID]ownerRef // владельцы дочерних блоков
 	children map[slotKey]blockID  // что лежит во владеющих слотах
+	slices   map[term]sliceInfo
+	pinned   map[blockID]bool // контейнер закрепил индексы региона
 
 	deferred []deferredFact // условные ensures после вызовов (ensures.go)
 }
@@ -36,13 +38,13 @@ type flow struct {
 func newFlow(st *congruence.State) *flow {
 	return &flow{st: st, cur: map[*types.Var]term{}, ptrs: map[term]ptrInfo{}, perms: map[blockID]perm{},
 		varBlk: map[*types.Var]blockID{}, content: map[blockID]term{},
-		owner: map[blockID]ownerRef{}, children: map[slotKey]blockID{}}
+		owner: map[blockID]ownerRef{}, children: map[slotKey]blockID{}, slices: map[term]sliceInfo{}, pinned: map[blockID]bool{}}
 }
 
 func (f *flow) clone() *flow {
 	return &flow{st: f.st.Clone(), cur: maps.Clone(f.cur), dead: f.dead,
 		ptrs: maps.Clone(f.ptrs), perms: maps.Clone(f.perms), varBlk: maps.Clone(f.varBlk), content: maps.Clone(f.content),
-		owner: maps.Clone(f.owner), children: maps.Clone(f.children), deferred: slices.Clone(f.deferred)}
+		owner: maps.Clone(f.owner), children: maps.Clone(f.children), deferred: slices.Clone(f.deferred), slices: maps.Clone(f.slices), pinned: maps.Clone(f.pinned)}
 }
 
 // funcChecker проверяет одно тело функции.
@@ -73,12 +75,16 @@ type funcChecker struct {
 	writes       []blockID              // журнал записей в блоки
 
 	// Сводка (summary.go).
-	paramBlocks []blockID // блоки параметров по позициям сводки, -1 — нет
-	acc         map[blockID]access
-	sum         *summary
-	exited      bool          // уже был выход: результаты сводки сливаются
-	async       *ast.CallExpr // вызов в операторе go
-	storing     string        // текст записываемого значения, для сообщений
+	paramBlocks   []blockID // блоки параметров по позициям сводки, -1 — нет
+	acc           map[blockID]access
+	sum           *summary
+	exited        bool          // уже был выход: результаты сводки сливаются
+	async         *ast.CallExpr // вызов в операторе go
+	storing       string        // текст записываемого значения, для сообщений
+	at            token.Pos     // текущая операция для диагностик утечки
+	sliceWant     []term        // контекст создания слайса; none — экзистенциальный индекс
+	localComments ast.CommentMap
+	sliceVars     map[*types.Var]sliceInfo
 
 	// ensures (ensures.go).
 	deferCall *ast.CallExpr // вызов в операторе defer
@@ -103,9 +109,15 @@ func (c *checker) checkFunc(sig *types.Signature, body *ast.BlockStmt, spec *bou
 		blockVar:     map[blockID]*types.Var{},
 		entryContent: map[blockID]term{},
 		acc:          map[blockID]access{},
+		sliceVars:    map[*types.Var]sliceInfo{},
 		sum:          emptySummary(sig),
 	}
 	fc.prescan(body)
+	for _, file := range c.pkg.Files {
+		if file.Pos() <= body.Pos() && body.End() <= file.End() {
+			fc.localComments = ast.NewCommentMap(c.pkg.Fset, file, file.Comments)
+		}
+	}
 	params := sigParams(sig)
 	fc.paramBlocks = make([]blockID, len(params))
 	for i, v := range params {
@@ -126,6 +138,14 @@ func (c *checker) checkFunc(sig *types.Signature, body *ast.BlockStmt, spec *bou
 			fc.paramBlocks[i] = b
 		}
 		fc.defineVar(v)
+	}
+	for v, t := range fc.entry {
+		if fc.sliceType(v.Type()) != nil {
+			if spec != nil && spec.Closes[v] != nil {
+				fc.setSliceClose(t, v.Type(), spec.Closes[v], fc.entry, none)
+			}
+			fc.sliceVars[v] = fc.sliceShape(t, v.Type())
+		}
 	}
 	for v := range sig.Results().Variables() {
 		if v.Name() != "" && v.Name() != "_" {
@@ -304,6 +324,9 @@ func (fc *funcChecker) havoc(vs []*types.Var) {
 	for _, v := range vs {
 		if _, ok := fc.fl.cur[v]; ok {
 			fc.fl.cur[v] = fc.fresh(v.Name())
+			if shape, ok := fc.sliceVars[v]; ok {
+				fc.putSlice(fc.fl.cur[v], v.Type(), shape.args)
+			}
 		}
 	}
 }
@@ -317,6 +340,9 @@ func (fc *funcChecker) stmts(list []ast.Stmt) {
 }
 
 func (fc *funcChecker) stmt(s ast.Stmt) {
+	previous := fc.at
+	fc.at = s.Pos()
+	defer func() { fc.at = previous }()
 	switch s := s.(type) {
 	case *ast.BlockStmt:
 		fc.stmts(s.List)
@@ -375,6 +401,9 @@ func (fc *funcChecker) stmt(s ast.Stmt) {
 		fc.expr(s.Call)
 		fc.deferCall = nil
 	case *ast.SendStmt:
+		if fc.sliceType(fc.info.TypeOf(s.Value)) != nil {
+			fc.errorf(s.Pos(), "sending indexed slices to channels is not supported")
+		}
 		fc.expr(s.Chan)
 		v := fc.expr(s.Value)
 		fc.escape(v, fc.info.TypeOf(s.Value), fmt.Sprintf("sent to a channel at line %d", fc.line(s.Arrow)), 2)
@@ -409,7 +438,17 @@ func (fc *funcChecker) assignStmt(s *ast.AssignStmt) {
 		fc.assign(s.Lhs[0], fc.fresh("opassign"), true)
 		return
 	}
-	rhs := fc.values(s.Rhs, len(s.Lhs))
+	var annotation []bound.Expr
+	if s.Tok == token.DEFINE && len(s.Lhs) == 1 {
+		annotation = fc.localClose(s, nil, fc.info.TypeOf(s.Lhs[0]))
+	}
+	var rhs []term
+	if annotation != nil && len(s.Rhs) == 1 {
+		rhs = []term{fc.sliceExpr(s.Rhs[0], fc.closeArgs(annotation, fc.fl.cur, none))}
+		fc.checkSliceClose(s.Pos(), rhs[0], fc.info.TypeOf(s.Lhs[0]), annotation, fc.fl.cur, none, "local declaration")
+	} else {
+		rhs = fc.values(s.Rhs, len(s.Lhs))
+	}
 	for i, l := range s.Lhs {
 		fc.storing = "value"
 		if len(s.Rhs) == len(s.Lhs) {
@@ -448,7 +487,18 @@ func (fc *funcChecker) declStmt(s *ast.DeclStmt) {
 	for _, sp := range gd.Specs {
 		vs := sp.(*ast.ValueSpec)
 		var vals []term
-		if len(vs.Values) > 0 {
+		var annotation []bound.Expr
+		if len(vs.Names) == 1 {
+			doc := vs.Doc
+			if doc == nil {
+				doc = gd.Doc
+			}
+			annotation = fc.localClose(s, doc, fc.varOf(vs.Names[0]).Type())
+		}
+		if annotation != nil && len(vs.Values) == 1 {
+			vals = []term{fc.sliceExpr(vs.Values[0], fc.closeArgs(annotation, fc.fl.cur, none))}
+			fc.checkSliceClose(s.Pos(), vals[0], fc.varOf(vs.Names[0]).Type(), annotation, fc.fl.cur, none, "local declaration")
+		} else if len(vs.Values) > 0 {
 			vals = fc.values(vs.Values, len(vs.Names))
 		}
 		for i, name := range vs.Names {
@@ -460,8 +510,14 @@ func (fc *funcChecker) declStmt(s *ast.DeclStmt) {
 				fc.fl.cur[v] = vals[i]
 			} else {
 				fc.fl.cur[v] = fc.zero(v.Type(), name.Pos())
+				if annotation != nil {
+					fc.setSliceClose(fc.fl.cur[v], v.Type(), annotation, fc.fl.cur, none)
+				}
 			}
 			fc.defineVar(v)
+			if fc.sliceType(v.Type()) != nil {
+				fc.sliceVars[v] = fc.sliceShape(fc.fl.cur[v], v.Type())
+			}
 			fc.storeVar(v, name.Pos(), fc.fl.cur[v])
 		}
 	}
@@ -478,6 +534,9 @@ func (fc *funcChecker) assign(lhs ast.Expr, val term, check bool) {
 		}
 		stored := fc.storedIn(v, l.Pos())
 		if !fc.isLocal(v) {
+			if fc.sliceType(v.Type()) != nil {
+				fc.errorf(l.Pos(), "global indexed slices are not supported")
+			}
 			fc.escape(val, v.Type(), stored, 2)
 			return
 		}
@@ -485,6 +544,15 @@ func (fc *funcChecker) assign(lhs ast.Expr, val term, check bool) {
 			fc.defineVar(v)
 		} else if b, ok := fc.fl.varBlk[v]; ok && check {
 			fc.checkRoot(l.Pos(), l, root{kind: rootBlocks, blocks: []blockID{b}}, true)
+		}
+		if old, ok := fc.fl.cur[v]; ok && fc.sliceType(v.Type()) != nil && check {
+			if fc.fl.st.AreEqual(val, fc.nilTerm()) {
+				val = fc.fresh("nil slice")
+				fc.putSlice(val, v.Type(), fc.sliceShape(old, v.Type()).args)
+			}
+			if !fc.compatibleSlice(l.Pos(), fc.sliceShape(val, v.Type()).args, fc.sliceShape(old, v.Type()).args, l.Name) {
+				return
+			}
 		}
 		if fc.addrTaken[v] {
 			if b, ok := fc.fl.varBlk[v]; ok {
@@ -497,10 +565,18 @@ func (fc *funcChecker) assign(lhs ast.Expr, val term, check bool) {
 		// Если у неё есть блок, право на запись проверено выше, и запись
 		// переменной целиком атомарна: индексы могут измениться.
 		_, hasBlock := fc.fl.varBlk[v]
+		if b, ok := fc.fl.varBlk[v]; ok && fc.indicesPinned(b) && check {
+			if old, exists := fc.fl.cur[v]; exists {
+				fc.preserve(l.Pos(), old, val, v.Type(), l.Name)
+			}
+		}
 		if old, ok := fc.fl.cur[v]; ok && fc.addrTaken[v] && check && !hasBlock {
 			fc.preserve(l.Pos(), old, val, v.Type(), l.Name)
 		}
 		fc.fl.cur[v] = val
+		if fc.sliceType(v.Type()) != nil {
+			fc.sliceVars[v] = fc.sliceShape(val, v.Type())
+		}
 	case *ast.SelectorExpr:
 		sel := fc.info.Selections[l]
 		if sel == nil || sel.Kind() != types.FieldVal || len(sel.Index()) != 1 {
@@ -514,6 +590,12 @@ func (fc *funcChecker) assign(lhs ast.Expr, val term, check bool) {
 			return
 		}
 		if info := fc.pointsTo(p); info.exact {
+			if fc.sliceType(fc.info.TypeOf(l)) != nil {
+				fc.compatibleSlice(l.Pos(), fc.sliceShape(val, fc.info.TypeOf(l)).args, fc.sliceShape(fc.deref(p), fc.info.TypeOf(l)).args, types.ExprString(l))
+			}
+			if fc.indicesPinned(info.blocks[0]) && check {
+				fc.preserve(l.Pos(), fc.deref(p), val, fc.info.TypeOf(l), types.ExprString(l))
+			}
 			fc.storeValue(l.Pos(), info.blocks[0], info.path, val, fc.info.TypeOf(l), types.ExprString(l))
 		} else {
 			fc.escape(val, fc.info.TypeOf(l), fmt.Sprintf("stored through %s at line %d", types.ExprString(l.X), fc.line(l.Pos())), 2)
@@ -528,8 +610,15 @@ func (fc *funcChecker) assign(lhs ast.Expr, val term, check bool) {
 			fc.preserve(l.Pos(), fc.deref(p), val, fc.info.TypeOf(l), types.ExprString(l))
 		}
 	case *ast.IndexExpr:
-		fc.expr(l.X)
+		s := fc.expr(l.X)
 		fc.expr(l.Index)
+		if sl := fc.sliceType(fc.info.TypeOf(l.X)); sl != nil {
+			fc.storeSliceElement(l.Pos(), val, sl.Elem(), fc.sliceShape(s, fc.info.TypeOf(l.X)).args)
+			return
+		}
+		if fc.sliceType(fc.info.TypeOf(l)) != nil {
+			fc.errorf(l.Pos(), "indexed slices inside other containers are not supported")
+		}
 		fc.escape(val, fc.info.TypeOf(l), fmt.Sprintf("stored in %s at line %d", types.ExprString(l), fc.line(l.Pos())), 2)
 	}
 }
@@ -578,13 +667,18 @@ func (fc *funcChecker) assignField(l *ast.SelectorExpr, f *types.Var, val term, 
 		// запись проверено выше). Обычные поля через указатель и так
 		// читаются как свежие термы.
 		info := fc.pointsTo(ptr)
-		nb, ok := fc.rebuild(l.Sel.Pos(), base, st, f, val, info.exact, check, lhs, x)
+		mutable := info.exact && !fc.indicesPinned(info.blocks[0])
+		nb, ok := fc.rebuild(l.Sel.Pos(), base, st, f, val, mutable, check, lhs, x)
 		if ok && info.exact {
 			fc.writeAt(l.Sel.Pos(), info.blocks[0], info.path, nb, x)
 		}
 		return
 	}
-	nb, ok := fc.rebuild(l.Sel.Pos(), base, st, f, val, true, check, lhs, x)
+	mutable := true
+	for _, b := range r.blocks {
+		mutable = mutable && !fc.indicesPinned(b)
+	}
+	nb, ok := fc.rebuild(l.Sel.Pos(), base, st, f, val, mutable, check, lhs, x)
 	// Ошибочное присваивание не применяем: об ошибке уже сообщили, дальше
 	// рассуждаем о прежнем объекте (иначе ошибки посыплются каскадом).
 	if !ok {
@@ -615,6 +709,10 @@ func (fc *funcChecker) rebuild(pos token.Pos, base term, st types.Type, f *types
 				}
 			}
 			if fa.Close != nil {
+				if fc.sliceType(f.Type()) != nil {
+					fc.checkSliceClose(pos, val, f.Type(), fa.Close, nil, base, lhs)
+					continue
+				}
 				target := fc.specs.Bounded(f.Type())
 				for i, arg := range fa.Close {
 					q := target.Params[i]
@@ -674,6 +772,10 @@ func soleField(s *bound.Struct, p *bound.Param) *types.Var {
 
 // preserve проверяет, что новое значение объекта имеет те же индексы, что и старое.
 func (fc *funcChecker) preserve(pos token.Pos, old, val term, t types.Type, what string) {
+	if fc.sliceType(t) != nil {
+		fc.compatibleSlice(pos, fc.sliceShape(val, t).args, fc.sliceShape(old, t).args, what)
+		return
+	}
 	s := fc.specs.Bounded(t)
 	if s == nil {
 		return
@@ -720,11 +822,19 @@ func (fc *funcChecker) returnStmt(s *ast.ReturnStmt) {
 			vals = append(vals, t)
 		}
 	default:
-		vals = fc.values(s.Results, fc.sig.Results().Len())
+		if len(s.Results) == 1 && fc.spec != nil && len(fc.spec.Returns) == 1 && fc.sliceType(fc.spec.Returns[0].Type) != nil && fc.spec.Returns[0].Args != nil {
+			vals = []term{fc.sliceExpr(s.Results[0], fc.closeArgs(fc.spec.Returns[0].Args, fc.entry, none))}
+		} else {
+			vals = fc.values(s.Results, fc.sig.Results().Len())
+		}
 	}
 	if fc.spec != nil && fc.spec.Returns != nil && len(vals) == len(fc.spec.Returns) {
 		for i, r := range fc.spec.Returns {
 			if r.Args == nil {
+				continue
+			}
+			if fc.sliceType(r.Type) != nil {
+				fc.checkSliceClose(s.Pos(), vals[i], r.Type, r.Args, fc.entry, none, "return")
 				continue
 			}
 			target := fc.specs.Bounded(r.Type)
@@ -739,6 +849,20 @@ func (fc *funcChecker) returnStmt(s *ast.ReturnStmt) {
 		}
 	}
 	fc.checkEnsures(s.Pos(), vals)
+	for i, t := range vals {
+		if i >= fc.sig.Results().Len() {
+			break
+		}
+		typ := fc.sig.Results().At(i).Type()
+		if fc.sliceType(typ) != nil && (fc.spec == nil || fc.spec.Returns == nil || fc.spec.Returns[i].Args == nil) {
+			for _, a := range fc.sliceShape(t, typ).args {
+				if a == none {
+					fc.errorf(s.Pos(), "returning an existential slice requires returns with <?>")
+					break
+				}
+			}
+		}
+	}
 	fc.exit(vals)
 	fc.fl.dead = true
 }
@@ -809,6 +933,7 @@ func (fc *funcChecker) cond(e ast.Expr) (pos, neg facts) {
 			fc.fl = saved.clone()
 			fc.assume(p1)
 			p2, _ := fc.cond(e.Y)
+			fc.copyPins(saved, fc.fl)
 			fc.fl = saved
 			fc.applyLosses(saved, mark)
 			return p1.and(p2), facts{}
@@ -818,6 +943,7 @@ func (fc *funcChecker) cond(e ast.Expr) (pos, neg facts) {
 			fc.fl = saved.clone()
 			fc.assume(n1)
 			_, n2 := fc.cond(e.Y)
+			fc.copyPins(saved, fc.fl)
 			fc.fl = saved
 			fc.applyLosses(saved, mark)
 			return facts{}, n1.and(n2)
@@ -890,6 +1016,26 @@ func (fc *funcChecker) join(a, b *flow) *flow {
 	out.content = contents
 	out.deferred = joinDeferred(a.deferred, b.deferred)
 	joinAlias(a, b, out)
+	for id, pinned := range a.pinned {
+		if pinned {
+			out.pinned[id] = true
+		}
+	}
+	for id, pinned := range b.pinned {
+		if pinned {
+			out.pinned[id] = true
+		}
+	}
+	for t, shape := range a.slices {
+		if _, ok := b.slices[t]; ok {
+			out.slices[t] = shape
+		}
+	}
+	for v, t := range out.cur {
+		if shape, ok := fc.sliceVars[v]; ok {
+			out.slices[t] = shape
+		}
+	}
 	return out
 }
 
@@ -926,9 +1072,13 @@ func (fc *funcChecker) loop(s ast.Stmt, init ast.Stmt, cond ast.Expr, post ast.S
 	iteration := func() {
 		fc.fl = after.clone()
 		if r, ok := s.(*ast.RangeStmt); ok {
-			for _, e := range []ast.Expr{r.Key, r.Value} {
+			for i, e := range []ast.Expr{r.Key, r.Value} {
 				if e != nil {
-					fc.assign(e, fc.fresh("range"), false)
+					t := fc.fresh("range")
+					if i == 1 && fc.sliceType(fc.info.TypeOf(r.X)) != nil {
+						t = fc.sliceElement(r.Pos(), fc.terms[ast.Unparen(r.X)], fc.info.TypeOf(r.X))
+					}
+					fc.assign(e, t, false)
 				}
 			}
 		}
@@ -951,6 +1101,11 @@ func (fc *funcChecker) loop(s ast.Stmt, init ast.Stmt, cond ast.Expr, post ast.S
 	iteration()
 	fc.silent--
 	fc.applyLosses(after, mark)
+	for b, pinned := range fc.fl.pinned {
+		if pinned {
+			after.pinned[rootIn(after, b)] = true
+		}
+	}
 	fc.havocBlocks(after, wmark)
 	fc.losses, fc.writes = fc.losses[:mark], fc.writes[:wmark]
 	iteration()

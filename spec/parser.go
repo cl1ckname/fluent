@@ -220,9 +220,15 @@ func (p *parser) returns(at token.Pos) *Returns {
 // args: '<' term (',' term)* '>'
 func (p *parser) args() []Term {
 	p.expect(kLt)
-	ts := []Term{p.term()}
+	arg := func() Term {
+		if t := p.peek(); p.got(kQuestion) {
+			return &Wildcard{At: t.pos}
+		}
+		return p.term()
+	}
+	ts := []Term{arg()}
 	for p.got(kComma) {
-		ts = append(ts, p.term())
+		ts = append(ts, arg())
 	}
 	p.expect(kGt)
 	return ts
@@ -249,11 +255,19 @@ func (p *parser) term() Term {
 }
 
 func (p *parser) typeName() TypeName {
+	prefix := ""
+	if p.got(kLbrack) {
+		p.expect(kRbrack)
+		prefix = "[]"
+		if p.got(kStar) {
+			prefix += "*"
+		}
+	}
 	id := p.ident()
 	if p.got(kDot) {
-		return TypeName{Pkg: &id, Name: p.ident()}
+		return TypeName{Prefix: prefix, Pkg: &id, Name: p.ident()}
 	}
-	return TypeName{Name: id}
+	return TypeName{Prefix: prefix, Name: id}
 }
 
 func (p *parser) ident() Ident {

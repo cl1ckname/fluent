@@ -59,9 +59,9 @@ func Touch(a *Account) Status { return a.Status }
 
 func Rename(a *Account, name string) { a.Name = name }
 
-var registry []*Account
+var registry *Account
 
-func Keep(a *Account) { registry = append(registry, a) }
+func Keep(a *Account) { registry = a }
 
 type Order struct {
 	Acc *Account

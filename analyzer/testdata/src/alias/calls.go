@@ -130,7 +130,8 @@ func many(as ...*Account) {}
 func variadic() {
 	p := &Account{Status: StatusActive}
 	many(p)
-	_ = p.Status // want `no access: passed to many`
+	_ = p.Status
+	p.Status = StatusInactive // want `cannot prove assignment .* preserves`
 }
 
 func (a *Account) Get() Status { return a.Status }

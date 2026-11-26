@@ -41,6 +41,12 @@ func (in *Info) StructOf(t types.Type) *Struct {
 
 // Bounded возвращает спецификацию t, если у t есть индексные параметры.
 func (in *Info) Bounded(t types.Type) *Struct {
+	if s, ok := t.Underlying().(*types.Slice); ok {
+		t = s.Elem()
+		if p, ok := t.Underlying().(*types.Pointer); ok {
+			t = p.Elem()
+		}
+	}
 	if s := in.StructOf(t); s != nil && len(s.Params) > 0 {
 		return s
 	}
@@ -150,6 +156,7 @@ type Func struct {
 	Requires []Equality
 	Returns  []Result // nil, если returns нет; иначе по одному на каждый результат
 	Ensures  []Ensure
+	Closes   map[*types.Var][]Expr // close на параметрах-слайсах
 }
 
 // Ensure — клауза ensures: если Guard верно на выходе (или Guard == nil),
@@ -221,6 +228,15 @@ type SelfParam struct {
 	At    token.Pos
 }
 
+type Wildcard struct {
+	Typ types.Type
+	At  token.Pos
+}
+
+func (e *Wildcard) Type() types.Type { return e.Typ }
+func (e *Wildcard) Pos() token.Pos   { return e.At }
+func (e *Wildcard) String() string   { return "?" }
+
 func (e *Var) Type() types.Type       { return e.Obj.Type() }
 func (e *Const) Type() types.Type     { return e.Typ }
 func (e *FieldOf) Type() types.Type   { return e.Field.Type() }
@@ -284,6 +300,12 @@ func (s *Struct) String() string {
 
 func (f *Func) String() string {
 	var parts []string
+	sig := f.Obj.Type().(*types.Signature)
+	for v := range sig.Params().Variables() {
+		if args := f.Closes[v]; args != nil {
+			parts = append(parts, v.Name()+" close <"+joinExprs(args)+">")
+		}
+	}
 	for _, e := range f.Requires {
 		parts = append(parts, "requires "+e.String())
 	}

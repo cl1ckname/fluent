@@ -49,6 +49,21 @@ func Keep(p *Pair) { global = p }
 func hidden(p *Pair) {}
 
 var global *Pair
+
+type Mixed struct {
+	// @ close <?, ?>;
+	Items []Box
+}
+
+// @ returns []Box<?, ?>;
+func MixedSlice() []Box { return []Box{{K: Neg, C: "x"}, {K: 7, C: "y"}} }
+
+func AcceptMixed(
+	// @ close <?, ?>;
+	xs []Box,
+) {}
+
+func PinBox(b *Box) { _ = []*Box{b} }
 `
 
 func TestFactsRoundTrip(t *testing.T) {

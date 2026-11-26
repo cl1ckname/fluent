@@ -96,6 +96,7 @@ type wireFunc struct {
 	HasReturns bool
 	Returns    []wireResult
 	Ensures    []wireEnsure
+	Closes     map[int][]wireExpr
 }
 
 type wireParamSum struct {
@@ -104,13 +105,15 @@ type wireParamSum struct {
 	OwnTo   int
 	OwnPath []wireRef
 	Wrote   bool
+	Pinned  bool
 }
 
 type wireResultSum struct {
-	Fresh bool
-	Alias int
-	Slot  []wireRef
-	Path  []wireRef
+	Fresh  bool
+	Alias  int
+	Slot   []wireRef
+	Path   []wireRef
+	Pinned bool
 }
 
 type wireSummary struct {
@@ -347,6 +350,8 @@ func sigIndex(sig *types.Signature, v *types.Var) (int, bool) {
 
 func (enc *encoder) expr(sig *types.Signature, e bound.Expr) (wireExpr, bool) {
 	switch e := e.(type) {
+	case *bound.Wildcard:
+		return wireExpr{Op: '?'}, true
 	case *bound.Var:
 		i, ok := sigIndex(sig, e.Obj)
 		return wireExpr{Op: 'v', Index: i}, ok
@@ -428,6 +433,15 @@ func (enc *encoder) funcSpec(f *bound.Func) (wireFunc, bool) {
 	}
 	sig := f.Obj.Type().(*types.Signature)
 	w := wireFunc{Obj: obj, HasReturns: f.Returns != nil}
+	w.Closes = map[int][]wireExpr{}
+	for v, args := range f.Closes {
+		i, found := sigIndex(sig, v)
+		a, valid := enc.exprs(sig, args)
+		if !found || !valid {
+			return wireFunc{}, false
+		}
+		w.Closes[i] = a
+	}
 	if w.Requires, ok = enc.eqs(sig, f.Requires); !ok {
 		return wireFunc{}, false
 	}
@@ -466,7 +480,7 @@ func (enc *encoder) summarySpec(fn *types.Func, s *summary) (wireSummary, bool) 
 		if !ok {
 			return wireSummary{}, false
 		}
-		w.Params = append(w.Params, wireParamSum{Access: p.access, Kept: p.kept, OwnTo: p.ownTo, OwnPath: path, Wrote: p.wrote})
+		w.Params = append(w.Params, wireParamSum{Access: p.access, Kept: p.kept, OwnTo: p.ownTo, OwnPath: path, Wrote: p.wrote, Pinned: p.pinned})
 	}
 	for _, r := range s.results {
 		slot, sok := enc.refs(r.slot)
@@ -474,7 +488,7 @@ func (enc *encoder) summarySpec(fn *types.Func, s *summary) (wireSummary, bool) 
 		if !sok || !pok {
 			return wireSummary{}, false
 		}
-		w.Results = append(w.Results, wireResultSum{Fresh: r.fresh, Alias: r.alias, Slot: slot, Path: path})
+		w.Results = append(w.Results, wireResultSum{Fresh: r.fresh, Alias: r.alias, Slot: slot, Path: path, Pinned: r.pinned})
 	}
 	return w, true
 }
@@ -678,6 +692,8 @@ func (d *decoder) param(owner wireRef, i int) *bound.Param {
 
 func (d *decoder) expr(sig *types.Signature, w wireExpr) bound.Expr {
 	switch w.Op {
+	case '?':
+		return &bound.Wildcard{}
 	case 'v':
 		if sig == nil {
 			return nil
@@ -785,6 +801,18 @@ func (d *decoder) funcSpec(w wireFunc) *bound.Func {
 	}
 	sig := fn.Type().(*types.Signature)
 	f := &bound.Func{Obj: fn}
+	f.Closes = map[*types.Var][]bound.Expr{}
+	for i, args := range w.Closes {
+		params := sigParams(sig)
+		if i < 0 || i >= len(params) {
+			return nil
+		}
+		a, valid := d.exprs(sig, args)
+		if !valid {
+			return nil
+		}
+		f.Closes[params[i]] = a
+	}
 	var ok bool
 	if f.Requires, ok = d.eqs(sig, w.Requires); !ok {
 		// Контракт без предусловия ослабил бы проверку вызовов: отбрасывается
@@ -840,7 +868,7 @@ func (d *decoder) summary(w wireSummary) (*types.Func, *summary) {
 		if !ok {
 			return nil, nil
 		}
-		s.params = append(s.params, paramSum{access: p.Access, kept: p.Kept, ownTo: p.OwnTo, ownPath: path, wrote: p.Wrote})
+		s.params = append(s.params, paramSum{access: p.Access, kept: p.Kept, ownTo: p.OwnTo, ownPath: path, wrote: p.Wrote, pinned: p.Pinned})
 	}
 	for _, r := range w.Results {
 		slot, sok := d.fields(r.Slot)
@@ -848,7 +876,7 @@ func (d *decoder) summary(w wireSummary) (*types.Func, *summary) {
 		if !sok || !pok {
 			return nil, nil
 		}
-		s.results = append(s.results, resultSum{fresh: r.Fresh, alias: r.Alias, slot: slot, path: path})
+		s.results = append(s.results, resultSum{fresh: r.Fresh, alias: r.Alias, slot: slot, path: path, pinned: r.Pinned})
 	}
 	return fn, s
 }

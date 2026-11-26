@@ -24,9 +24,13 @@ const (
 	kAnd   // &&
 	kNeq   // !=
 	kImpl  // ==>
+	kQuestion
+	kLbrack
+	kRbrack
+	kStar
 )
 
-var kindNames = [...]string{"end of spec", "identifier", "literal", "'<'", "'>'", "','", "';'", "'.'", "'=='", "'&&'", "'!='", "'==>'"}
+var kindNames = [...]string{"end of spec", "identifier", "literal", "'<'", "'>'", "','", "';'", "'.'", "'=='", "'&&'", "'!='", "'==>'", "'?'", "'['", "']'", "'*'"}
 
 func (k kind) String() string { return kindNames[k] }
 
@@ -118,6 +122,14 @@ func lex(b Block) ([]tok, []Error) {
 
 func punct(s string) (kind, int) {
 	switch s[0] {
+	case '?':
+		return kQuestion, 1
+	case '[':
+		return kLbrack, 1
+	case ']':
+		return kRbrack, 1
+	case '*':
+		return kStar, 1
 	case '<':
 		return kLt, 1
 	case '>':

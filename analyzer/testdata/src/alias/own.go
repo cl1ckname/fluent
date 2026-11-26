@@ -29,17 +29,107 @@ func secondOwner() {
 	o1.Acc = o2.Acc // want `cannot store o2.Acc in o1.Acc: o2.Acc already belongs to`
 }
 
-// Запись в слот заменяет прежний объект: он теряет права.
+// Запись в слот возвращает прежнему объекту самостоятельное полное право.
 func replace() {
 	a1 := &Account{Status: StatusActive}
 	a2 := &Account{Status: StatusActive}
 	o := &Order{Acc: a1}
 	o.Acc = a2
-	_ = a1.Status // want `no access: replaced in o.Acc at line \d+`
+	requireActive(a1)
+	a1.Status = StatusInactive
+	requireActive(o.Acc)
 	a2.Status = StatusInactive
 	requireInactive(o.Acc)
 	o.Acc = nil
-	_ = a2.Status // want `no access: replaced in o.Acc`
+	requireInactive(a2)
+	a2.Status = StatusActive
+	requireActive(a2)
+}
+
+// Символический дочерний блок также можно извлечь; все его алиасы сохраняются.
+func extract(o *Order) {
+	p := o.Acc
+	alias := p
+	p.Status = StatusActive
+	o.Acc = nil
+	requireActive(alias)
+	p.Status = StatusInactive
+	requireInactive(alias)
+	use(o.Acc)
+	requireInactive(p)
+}
+
+// Самоприсваивание и запись известного алиаса сохраняют регион.
+func selfStore(o *Order) {
+	p := o.Acc
+	p.Status = StatusActive
+	o.Acc = o.Acc
+	requireActive(p)
+	o.Acc = p
+	requireActive(o.Acc)
+	p.Status = StatusInactive
+	requireInactive(o.Acc)
+}
+
+// При извлечении сохраняется весь подрегион, а права корней независимы.
+func extractSubregion() {
+	acc := &Account{Status: StatusActive}
+	child := &Node{Acc: *acc, Next: &Node{}}
+	grandchild := child.Next
+	root := &Node{Next: child}
+	p := root.Next
+	root.Next = nil
+	useNode(root)
+	requireActive(&p.Acc)
+	grandchild.Acc.Status = StatusInactive
+	requireInactive(&child.Next.Acc)
+	useNode(p)
+	_ = grandchild.Acc.Status // want `no access: .* may have been replaced`
+}
+
+var globalNode *Node
+
+func useNode(n *Node) { globalNode = n }
+
+// Ошибочная вставка не освобождает прежний объект.
+func failedReplacement() {
+	o1 := &Order{Acc: &Account{Status: StatusActive}}
+	o2 := &Order{Acc: &Account{Status: StatusActive}}
+	p := o1.Acc
+	o1.Acc = o2.Acc // want `cannot store o2.Acc in o1.Acc: o2.Acc already belongs to`
+	use(o1.Acc)
+	_ = p.Status // want `no access: .* may have been replaced`
+}
+
+// Извлечение лишь на одной ветке не выдаёт самостоятельного права после слияния.
+func conditionalExtract(c bool) {
+	o := &Order{Acc: &Account{Status: StatusActive}}
+	p := o.Acc
+	if c {
+		o.Acc = nil
+	}
+	_ = p.Status // want `no access`
+}
+
+// После извлечения объект можно перенести к другому владельцу.
+func reattach() {
+	o1 := &Order{Acc: &Account{Status: StatusActive}}
+	p := o1.Acc
+	o1.Acc = nil
+	o2 := &Order{Acc: p}
+	p.Status = StatusInactive
+	requireInactive(o2.Acc)
+	use(o2.Acc)
+	_ = p.Status // want `no access: .* may have been replaced`
+}
+
+// Потерянное право на регион нельзя восстановить очисткой поля.
+func extractWithoutAccess() {
+	o := &Order{Acc: &Account{Status: StatusActive}}
+	p := o.Acc
+	use(p)
+	o.Acc = nil  // want `cannot write o.Acc: no access`
+	_ = p.Status // want `no access`
 }
 
 type Node struct {

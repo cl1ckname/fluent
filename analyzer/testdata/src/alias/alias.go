@@ -173,7 +173,8 @@ func conditions(c bool) {
 func escapes(ch chan *Account) {
 	p1 := &Account{Status: StatusActive}
 	_ = []*Account{p1}
-	_ = p1.Status // want `no access: stored in a composite literal`
+	_ = p1.Status
+	p1.Status = StatusInactive // want `cannot prove assignment .* preserves`
 
 	p2 := &Account{Status: StatusActive}
 	globalPtr = p2
